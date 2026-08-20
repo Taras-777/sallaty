@@ -1,11 +1,34 @@
 """Telegram-бот обліку заробітку за коробки.
 
 Схема зберігання: один Excel-файл на користувача на місяць — data/{user_id}_{YYYY-MM}.xlsx
-Колонки: Дата | Великі коробки | Малі коробки | Загальна сума за день
+Колонки: Дата | Коробки 177 | Коробки 161 | Загальна сума за день
+(назви типів коробок задаються константами BIG_LABEL/SMALL_LABEL, можна
+перевизначити в config.py, якщо номери коробок знову зміняться)
 
 Запуск:
     python3 salary_bot.py
 Токен береться з config.py (BOT_TOKEN) або зі змінної оточення BOT_TOKEN.
+
+Реєстрація:
+    При першому /start (якщо ім'я ще не збережено) бота просить людину
+    написати ім'я та прізвище — це ім'я потім показується адміну в
+    запитах на підтвердження і в списку користувачів. Зберігається в
+    data/users.json разом із Telegram-юзернеймом.
+
+Підтвердження адміном:
+    Коли звичайний користувач (не з ADMIN_IDS) додає новий день або
+    редагує/видаляє вже внесений запис, дані НЕ зберігаються одразу —
+    запит стає в чергу. Адміну летить лише легке сповіщення "🔔 Новий
+    запит на підтвердження" без деталей і кнопок — щойно один такий
+    прийшов, наступні (від того самого чи інших користувачів) вже
+    мовчазні, поки адмін не розгребе чергу. Деталі та дії — тільки через
+    кнопку меню «⏳ Очікують підтвердження (N)»: список користувачів із
+    відкритими запитами → підтвердити/відхилити/відредагувати по черзі.
+    Хто з адмінів відповість першим — того рішення і застосовується.
+    Користувачу приходить окреме повідомлення з результатом. Записи, які
+    вносить сам адмін, зберігаються одразу, без підтвердження. Черга
+    запитів зберігається в пам'яті процесу і не переживає перезапуск бота
+    (systemctl restart) — це відоме обмеження поточної реалізації.
 """
 
 from __future__ import annotations
@@ -13,8 +36,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
+import uuid
 from collections import deque
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -23,10 +48,21 @@ from typing import Iterable, Optional
 from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook, load_workbook
-from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.error import BadRequest, Conflict, NetworkError
 from telegram.ext import (
     Application,
+    BaseUpdateProcessor,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -60,6 +96,10 @@ RATE_BIG = Decimal(str(_setting("RATE_BIG", "0.90")))
 RATE_SMALL = Decimal(str(_setting("RATE_SMALL", "0.70")))
 SPLIT = Decimal(str(_setting("SPLIT", "2")))  # ділимо заробіток навпіл
 
+# Назви типів коробок, як їх бачить користувач (можна перевизначити в config.py).
+BIG_LABEL = str(_setting("BIG_LABEL", "Коробки 177"))
+SMALL_LABEL = str(_setting("SMALL_LABEL", "Коробки 161"))
+
 _raw_admins = _setting("ADMIN_IDS", "442336138")
 if isinstance(_raw_admins, (set, list, tuple)):
     ADMIN_IDS = {int(x) for x in _raw_admins}
@@ -76,7 +116,7 @@ LOG_FILE = DATA_DIR / "salary_bot.log"
 USERS_FILE = DATA_DIR / "users.json"
 
 SHEET_NAME = "Salary"
-COLUMNS = ["Дата", "Великі коробки", "Малі коробки", "Загальна сума за день"]
+COLUMNS = ["Дата", BIG_LABEL, SMALL_LABEL, "Загальна сума за день"]
 
 TELEGRAM_TEXT_LIMIT = 3500  # запас до ліміту 4096
 
@@ -87,7 +127,10 @@ TELEGRAM_TEXT_LIMIT = 3500  # запас до ліміту 4096
 logger = logging.getLogger("salary_bot")
 if not logger.handlers:
     logger.setLevel(logging.INFO)
-    _handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    # Ротація: до 5 МБ на файл, 5 старих копій (salary_bot.log.1 … .5). Для
+    # команди 20-30 людей цього з запасом вистачає на місяці історії, а без
+    # ротації лог ріс би необмежено роками роботи сервісу.
+    _handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
     _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(_handler)
     _console = logging.StreamHandler()
@@ -106,7 +149,12 @@ if not logger.handlers:
     WAIT_NEXT_ACTION,
     WAIT_MONTH_INPUT,
     WAIT_EDIT_VALUES,
-) = range(7)
+    WAIT_EDIT_CONFIRM,
+    WAIT_REGISTER_NAME,
+    WAIT_ADMIN_EDIT_BIG,
+    WAIT_ADMIN_EDIT_SMALL,
+    WAIT_ADMIN_EDIT_CONFIRM,
+) = range(12)
 
 MONTH_PATTERN = re.compile(r"^\d{4}-\d{2}$")
 DATE_PATTERN = re.compile(r"^(\d{1,2})[-.,](\d{1,2})[-.,](\d{4})$")
@@ -120,13 +168,24 @@ RE_ADMIN_LOG_TAIL = re.compile(r"^admin_log_tail_(\d+)$")
 RE_ADMIN_LOG_USER = re.compile(r"^admin_log_user_(\d+)$")
 RE_ADMIN_LOG_USER_TAIL = re.compile(r"^admin_log_user_tail_(\d+)_(\d+)$")
 RE_ADMIN_LOG_USER_FILE = re.compile(r"^admin_log_user_file_(\d+)$")
+RE_ADMIN_SUMMARY = re.compile(r"^admin_summary_(\d{4}-\d{2})$")
+
+# Запити на підтвердження запису адміном (review_<дія>_<id>, id — 8 hex символів).
+RE_REVIEW_APPROVE = re.compile(r"^review_approve_([0-9a-f]{8})$")
+RE_REVIEW_REJECT = re.compile(r"^review_reject_([0-9a-f]{8})$")
+RE_REVIEW_EDIT = re.compile(r"^review_edit_([0-9a-f]{8})$")
+RE_REVIEW_USER = re.compile(r"^review_user_(\d+)$")
 
 CALLBACK_PATTERN = re.compile(
-    r"^(add_more|show_month_total|edit_day_menu|close_entry|manual_month_total"
+    r"^(add_more|show_month_total|edit_day_menu|close_entry"
     r"|month_total_\d{4}-\d{2}|download_\d{4}-\d{2}"
     r"|admin_users|admin_user_\d+|admin_logs|admin_log_by_user|admin_log_file"
     r"|admin_log_tail_\d+|admin_log_user_\d+|admin_log_user_tail_\d+_\d+"
-    r"|admin_log_user_file_\d+)$"
+    r"|admin_log_user_file_\d+"
+    r"|admin_monthly_summary|admin_summary_\d{4}-\d{2}"
+    r"|review_approve_[0-9a-f]{8}|review_reject_[0-9a-f]{8}|review_edit_[0-9a-f]{8}"
+    r"|review_user_\d+"
+    r"|pending_reviews|my_pending_reviews)$"
 )
 
 # --------------------------------------------------------------------------- #
@@ -464,24 +523,273 @@ def _read_all_totals_sync(month: str) -> tuple[Decimal, list[str]]:
     return money(total), names
 
 
+def _monthly_summary_rows_sync(month: str) -> list[dict]:
+    """Підсумок за місяць по кожному користувачу: скільки коробок кожного
+    типу зробив і на яку суму — для зведеної Excel-таблиці для адміна."""
+    user_map = _load_user_map_sync()
+    rows = []
+    for path in _list_user_files_sync(month=month):
+        match = USER_FILE_PATTERN.match(path.name)
+        if not match:
+            continue
+        uid = int(match.group(1))
+
+        workbook, sheet, changed = _open_sheet(path)
+        if changed:
+            workbook.save(path)
+
+        big_sum = 0
+        small_sum = 0
+        money_sum = Decimal("0.00")
+        for row in sheet.iter_rows(min_row=2, values_only=True):
+            if not row or row[0] is None:
+                continue
+            if not DATE_CELL_PATTERN.match(str(row[0]).strip()):
+                continue
+            big_sum += _as_int(row[1] if len(row) > 1 else 0)
+            small_sum += _as_int(row[2] if len(row) > 2 else 0)
+            money_sum += _row_total(row)
+        workbook.close()
+
+        entry = user_map.get(str(uid), {})
+        name = (entry.get("registered_name") or entry.get("telegram_label") or "").strip() or str(uid)
+        rows.append(
+            {
+                "user_id": uid,
+                "name": name,
+                "big": big_sum,
+                "small": small_sum,
+                "total_boxes": big_sum + small_sum,
+                "money": money(money_sum),
+            }
+        )
+
+    # У "Зведенні" — хто заробив більше, той згори (за рівних сум — за алфавітом).
+    rows.sort(key=lambda r: (-r["money"], r["name"].lower()))
+    return rows
+
+
+def _daily_matrix_sync(month: str) -> tuple[list[str], list[dict], dict[tuple[str, int], tuple[int, int, Decimal]]]:
+    """Дані для щоденної зведеної таблиці: список дат за місяць (де хоч у когось
+    є запис), список користувачів (за алфавітом) і мапа (дата, user_id) ->
+    (великі, малі, сума за день)."""
+    user_map = _load_user_map_sync()
+    users: list[dict] = []
+    cells: dict[tuple[str, int], tuple[int, int, Decimal]] = {}
+    dates: set[str] = set()
+
+    for path in _list_user_files_sync(month=month):
+        match = USER_FILE_PATTERN.match(path.name)
+        if not match:
+            continue
+        uid = int(match.group(1))
+
+        workbook, sheet, changed = _open_sheet(path)
+        if changed:
+            workbook.save(path)
+
+        entry = user_map.get(str(uid), {})
+        name = (entry.get("registered_name") or entry.get("telegram_label") or "").strip() or str(uid)
+        users.append({"user_id": uid, "name": name})
+
+        for row in sheet.iter_rows(min_row=2, values_only=True):
+            if not row or row[0] is None:
+                continue
+            date_value = str(row[0]).strip()
+            if not DATE_CELL_PATTERN.match(date_value):
+                continue
+            big = _as_int(row[1] if len(row) > 1 else 0)
+            small = _as_int(row[2] if len(row) > 2 else 0)
+            day_money = _row_total(row)
+            dates.add(date_value)
+            cells[(date_value, uid)] = (big, small, day_money)
+        workbook.close()
+
+    users.sort(key=lambda u: u["name"].lower())
+    return sorted(dates), users, cells
+
+
+_GRANDTOTAL_FILL = PatternFill(start_color="FFD6E4F5", end_color="FFD6E4F5", fill_type="solid")
+
+
+def _write_daily_detail_sheet(
+    workbook: Workbook,
+    dates: list[str],
+    users: list[dict],
+    cells: dict[tuple[str, int], tuple[int, int, Decimal]],
+) -> None:
+    """Деталізація за днями: для кожної дати — рядок на кожного користувача, який
+    того дня щось вносив (великі/малі шт., сума за великі/малі окремо, разом за
+    день). Комірка «Дата» об'єднана по всьому блоку дня. Внизу — один підсумковий
+    рядок «Разом за місяць» по всіх людях і днях разом."""
+    sheet = workbook.create_sheet("Деталізація за днями")
+    headers = [
+        "Дата",
+        "Користувач",
+        f"{BIG_LABEL}, шт",
+        f"{SMALL_LABEL}, шт",
+        f"{BIG_LABEL} — сума, €",
+        f"{SMALL_LABEL} — сума, €",
+        "Разом за день, €",
+    ]
+    sheet.append(headers)
+    sheet.row_dimensions[1].height = 30
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+
+    month_big = month_small = 0
+    month_big_money = month_small_money = Decimal("0.00")
+    row_idx = 2
+
+    for date_value in dates:
+        date_label = datetime.strptime(date_value, "%Y-%m-%d").strftime("%d-%m-%Y")
+        day_users = [u for u in users if (date_value, u["user_id"]) in cells]
+        if not day_users:
+            continue
+
+        block_start = row_idx
+        for user in day_users:
+            big, small, _stored_total = cells[(date_value, user["user_id"])]
+            big_money, small_money, _ = calc_day_total(big, small)
+            sheet.append(
+                [date_label, user["name"], big, small, float(big_money), float(small_money), float(big_money + small_money)]
+            )
+            for col in (5, 6, 7):
+                sheet.cell(row=row_idx, column=col).number_format = '0.00" €"'
+            month_big += big
+            month_small += small
+            month_big_money += big_money
+            month_small_money += small_money
+            row_idx += 1
+
+        if len(day_users) > 1:
+            sheet.merge_cells(start_row=block_start, start_column=1, end_row=row_idx - 1, end_column=1)
+            sheet.cell(row=block_start, column=1).alignment = Alignment(vertical="center")
+
+    month_total = month_big_money + month_small_money
+    sheet.append(
+        [
+            "Разом за місяць", "", month_big, month_small,
+            float(month_big_money), float(month_small_money), float(month_total),
+        ]
+    )
+    for cell in sheet[row_idx]:
+        cell.font = Font(bold=True)
+        cell.fill = _GRANDTOTAL_FILL
+    sheet.cell(row=row_idx, column=5).number_format = '0.00" €"'
+    sheet.cell(row=row_idx, column=6).number_format = '0.00" €"'
+    sheet.cell(row=row_idx, column=7).number_format = '0.00" €"'
+
+    sheet.freeze_panes = "A2"
+    for col_idx, width in enumerate([13, 26, 12, 12, 20, 20, 16], start=1):
+        sheet.column_dimensions[get_column_letter(col_idx)].width = width
+
+
+def _build_monthly_summary_sync(month: str) -> Optional[Path]:
+    """Будує зведену книгу за місяць: підсумок по кожному користувачу плюс
+    деталізація по днях (хто скільки 177/161 зробив і на яку суму кожного дня,
+    з підсумком за день і за місяць). Зберігає у тимчасовий xlsx у DATA_DIR.
+    Повертає None, якщо за місяць немає даних."""
+    rows = _monthly_summary_rows_sync(month)
+    if not rows:
+        return None
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Зведення"
+
+    headers = ["№", "Користувач", "ID", BIG_LABEL, SMALL_LABEL, "Разом коробок", "Сума, €"]
+    sheet.append(headers)
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+
+    for idx, row in enumerate(rows, start=1):
+        sheet.append(
+            [idx, row["name"], row["user_id"], row["big"], row["small"], row["total_boxes"], float(row["money"])]
+        )
+        sheet.cell(row=idx + 1, column=7).number_format = '0.00" €"'
+
+    total_big = sum(row["big"] for row in rows)
+    total_small = sum(row["small"] for row in rows)
+    total_boxes = sum(row["total_boxes"] for row in rows)
+    total_money = money(sum(row["money"] for row in rows))
+
+    total_row_idx = len(rows) + 2
+    sheet.append(["", "Разом за місяць", "", total_big, total_small, total_boxes, float(total_money)])
+    for cell in sheet[total_row_idx]:
+        cell.font = Font(bold=True)
+    sheet.cell(row=total_row_idx, column=7).number_format = '0.00" €"'
+
+    sheet.freeze_panes = "A2"
+    for col_idx, width in enumerate([4, 26, 12, 14, 14, 15, 13], start=1):
+        sheet.column_dimensions[get_column_letter(col_idx)].width = width
+
+    dates, users, cells = _daily_matrix_sync(month)
+    if dates and users:
+        _write_daily_detail_sheet(workbook, dates, users, cells)
+
+    tmp_path = DATA_DIR / f"summary_{month}.xlsx"
+    workbook.save(tmp_path)
+    return tmp_path
+
+
 def _load_user_map_sync() -> dict:
+    """Повертає {user_id_str: {"telegram_label": str, "registered_name": Optional[str]}}.
+
+    Старий формат (значення — просто рядок з юзернеймом) переводиться в нову
+    форму на льоту; на диску перепишеться при першому ж збереженні.
+    """
     if not USERS_FILE.exists():
         return {}
     try:
         with open(USERS_FILE, "r", encoding="utf-8") as fh:
-            return json.load(fh)
+            raw = json.load(fh)
     except (OSError, json.JSONDecodeError):
         logger.warning("users.json is unreadable, treating as empty")
         return {}
 
+    mapping: dict = {}
+    for key, value in raw.items():
+        if isinstance(value, dict):
+            mapping[key] = {
+                "telegram_label": value.get("telegram_label", ""),
+                "registered_name": value.get("registered_name"),
+            }
+        else:
+            mapping[key] = {"telegram_label": str(value or ""), "registered_name": None}
+    return mapping
+
+
+def _save_user_map_sync(mapping: dict) -> None:
+    with open(USERS_FILE, "w", encoding="utf-8") as fh:
+        json.dump(mapping, fh, ensure_ascii=False, indent=2)
+
 
 def _register_user_sync(user_id: int, display_name: str) -> None:
     mapping = _load_user_map_sync()
-    if mapping.get(str(user_id)) == display_name:
+    entry = mapping.get(str(user_id), {"telegram_label": "", "registered_name": None})
+    if entry.get("telegram_label") == display_name:
         return
-    mapping[str(user_id)] = display_name
-    with open(USERS_FILE, "w", encoding="utf-8") as fh:
-        json.dump(mapping, fh, ensure_ascii=False, indent=2)
+    entry["telegram_label"] = display_name
+    mapping[str(user_id)] = entry
+    _save_user_map_sync(mapping)
+
+
+def _save_registered_name_sync(user_id: int, full_name: str) -> None:
+    mapping = _load_user_map_sync()
+    entry = mapping.get(str(user_id), {"telegram_label": "", "registered_name": None})
+    entry["registered_name"] = full_name
+    mapping[str(user_id)] = entry
+    _save_user_map_sync(mapping)
+
+
+def _get_registered_name_sync(user_id: int) -> Optional[str]:
+    mapping = _load_user_map_sync()
+    entry = mapping.get(str(user_id))
+    if isinstance(entry, dict):
+        return entry.get("registered_name")
+    return None
 
 
 def _tail_log_sync(lines: int, marker: Optional[str] = None) -> list[str]:
@@ -545,6 +853,10 @@ async def read_all_totals(month: str) -> tuple[Decimal, list[str]]:
     return await asyncio.to_thread(_read_all_totals_sync, month)
 
 
+async def build_monthly_summary(month: str) -> Optional[Path]:
+    return await asyncio.to_thread(_build_monthly_summary_sync, month)
+
+
 async def list_months(user_id: Optional[int]) -> list[str]:
     return await asyncio.to_thread(_list_months_sync, user_id)
 
@@ -580,19 +892,31 @@ async def known_users() -> dict[int, tuple[str, bool]]:
     """Усі відомі користувачі: {id: (ім'я, чи є дані)}.
 
     Джерела об'єднуються — users.json (усі, хто хоч раз запускав бота)
-    і файли даних (на випадок, якщо users.json загубився).
+    і файли даних (на випадок, якщо users.json загубився). Як ім'я
+    пріоритетно береться те, яке людина вписала при реєстрації, інакше —
+    її Telegram-юзернейм/ім'я, автоматично зафіксовані при /start.
     """
     with_data = set(await list_user_ids())
     user_map = await load_user_map()
 
     result: dict[int, tuple[str, bool]] = {}
-    for key, name in user_map.items():
+    for key, entry in user_map.items():
         if str(key).isdigit():
             uid = int(key)
-            result[uid] = (name or "", uid in with_data)
+            label = (entry.get("registered_name") or entry.get("telegram_label") or "") if isinstance(entry, dict) else ""
+            result[uid] = (label, uid in with_data)
     for uid in with_data:
         result.setdefault(uid, ("", True))
     return dict(sorted(result.items()))
+
+
+async def save_registered_name(user_id: int, full_name: str) -> None:
+    async with _lock_for(USERS_FILE.name):
+        await asyncio.to_thread(_save_registered_name_sync, user_id, full_name)
+
+
+async def get_registered_name(user_id: int) -> Optional[str]:
+    return await asyncio.to_thread(_get_registered_name_sync, user_id)
 
 
 async def tail_log(lines: int, marker: Optional[str] = None) -> list[str]:
@@ -629,18 +953,34 @@ def build_main_menu(user_id: Optional[int] = None, month: Optional[str] = None) 
     if has_data:
         buttons.insert(1, [InlineKeyboardButton("📥 Завантажити файл", callback_data=f"download_{month}")])
     if is_admin(user_id):
+        pending_count = _pending_review_count()
+        buttons.append(
+            [InlineKeyboardButton(f"⏳ Очікують підтвердження ({pending_count})", callback_data="pending_reviews")]
+        )
         buttons.append(
             [
                 InlineKeyboardButton("👥 Користувачі", callback_data="admin_users"),
                 InlineKeyboardButton("🗒️ Логи", callback_data="admin_logs"),
             ]
         )
+        buttons.append(
+            [InlineKeyboardButton("📈 Зведення за місяць", callback_data="admin_monthly_summary")]
+        )
+    elif user_id is not None:
+        my_pending = _user_pending_count(user_id)
+        if my_pending:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"⏳ Очікують підтвердження ({my_pending})", callback_data="my_pending_reviews"
+                    )
+                ]
+            )
     return InlineKeyboardMarkup(buttons)
 
 
 def build_month_selection_keyboard(months: list[str]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(month, callback_data=f"month_total_{month}")] for month in months]
-    rows.append([InlineKeyboardButton("✍️ Ввести вручну", callback_data="manual_month_total")])
     rows.append([InlineKeyboardButton("🏠 Меню", callback_data="close_entry")])
     return InlineKeyboardMarkup(rows)
 
@@ -656,15 +996,62 @@ def build_month_result_keyboard(month: str) -> InlineKeyboardMarkup:
     )
 
 
+def build_admin_summary_month_keyboard(months: list[str]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(month, callback_data=f"admin_summary_{month}")] for month in months]
+    rows.append([InlineKeyboardButton("🏠 Меню", callback_data="close_entry")])
+    return InlineKeyboardMarkup(rows)
+
+
+# Одне «активне» меню на чат: message_id останнього повідомлення з робочими
+# кнопками. Перед тим як показати нове меню новим повідомленням (не редагуючи
+# старе), кнопки з попереднього прибираються — щоб у чаті ніколи не лишалось
+# декількох одночасно клікабельних меню.
+_active_menu_message: dict[int, int] = {}
+
+
+async def _clear_previous_menu(bot, chat_id: int) -> None:
+    old_message_id = _active_menu_message.get(chat_id)
+    if old_message_id is None:
+        return
+    try:
+        await bot.edit_message_reply_markup(chat_id=chat_id, message_id=old_message_id, reply_markup=None)
+    except Exception:  # noqa: BLE001 — повідомлення могли вже видалити чи відредагувати вручну
+        pass
+
+
 async def safe_edit(query: CallbackQuery, text: str, reply_markup=None) -> None:
-    """edit_message_text, який не падає на 'Message is not modified'."""
+    """edit_message_text, який не падає на 'Message is not modified'.
+
+    Редагує те саме повідомлення на місці, тож воно й лишається єдиним
+    активним меню в чаті — просто оновлюємо трекер на випадок наступного
+    send_menu_reply (щоб було що прибирати)."""
     try:
         await query.edit_message_text(text, reply_markup=reply_markup)
     except BadRequest as error:
-        if "Message is not modified" in str(error):
-            logger.debug("Ignored 'Message is not modified'")
-            return
-        raise
+        if "Message is not modified" not in str(error):
+            raise
+        logger.debug("Ignored 'Message is not modified'")
+
+    chat_id = query.message.chat_id
+    if reply_markup is not None:
+        _active_menu_message[chat_id] = query.message.message_id
+    else:
+        _active_menu_message.pop(chat_id, None)
+
+
+async def send_menu_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
+    """Заміна update.message.reply_text для «менюшних» відповідей: перед тим як
+    надіслати нове повідомлення, прибирає кнопки з попереднього активного меню
+    в цьому чаті, щоб завжди залишалось рівно одне робоче меню, а не купа
+    старих клікабельних вікон одне під одним."""
+    chat_id = update.effective_chat.id
+    await _clear_previous_menu(context.bot, chat_id)
+    message = await update.message.reply_text(text, reply_markup=reply_markup)
+    if reply_markup is not None:
+        _active_menu_message[chat_id] = message.message_id
+    else:
+        _active_menu_message.pop(chat_id, None)
+    return message
 
 
 async def send_lines(query: CallbackQuery, lines: list[str], header: str, filename: str) -> None:
@@ -686,6 +1073,242 @@ async def send_lines(query: CallbackQuery, lines: list[str], header: str, filena
 
 
 # --------------------------------------------------------------------------- #
+# Підтвердження адміном (review)
+#
+# Записи звичайних користувачів не пишуться в Excel одразу — створюється
+# запис у _pending_reviews, а адміну летить лише легке сповіщення (без
+# деталей і кнопок; повторно не турбуємо, поки черга не спорожніє — див.
+# _notified_admins). Самі дії (підтвердити/відхилити/відредагувати) — тільки
+# через кнопку меню «⏳ Очікують підтвердження». Перша відповідь виграє (під
+# локом). Записи самих адмінів (is_admin) зберігаються без цього кроку —
+# див. confirm_entry / process_edit_values.
+# --------------------------------------------------------------------------- #
+
+_pending_reviews: dict[str, dict] = {}
+
+
+def _new_review_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def _user_label(user) -> str:
+    username = getattr(user, "username", None)
+    if username:
+        return f"@{username}"
+    full_name = getattr(user, "full_name", None)
+    return full_name or str(getattr(user, "id", "?"))
+
+
+async def _review_author_label(user) -> str:
+    """Ім'я та прізвище, вписані при реєстрації — якщо їх ще немає, запасний варіант з Telegram."""
+    registered_name = await get_registered_name(user.id)
+    return registered_name or _user_label(user)
+
+
+def _pending_review_count() -> int:
+    return sum(1 for review in _pending_reviews.values() if review["status"] == "pending")
+
+
+def _pending_reviews_sorted() -> list[dict]:
+    """Усі запити зі статусом pending, у порядку надходження (найстаріші перші)."""
+    reviews = [review for review in _pending_reviews.values() if review["status"] == "pending"]
+    reviews.sort(key=lambda review: review.get("created_at", 0))
+    return reviews
+
+
+def _pending_reviews_by_user() -> dict[int, list[dict]]:
+    """Групує запити по користувачу, зберігаючи хронологічний порядок усередині групи."""
+    grouped: dict[int, list[dict]] = {}
+    for review in _pending_reviews_sorted():
+        grouped.setdefault(review["user_id"], []).append(review)
+    return grouped
+
+
+def _user_pending_reviews(user_id: int) -> list[dict]:
+    """Власні запити цього користувача, що ще очікують підтвердження адміном."""
+    return [review for review in _pending_reviews_sorted() if review["user_id"] == user_id]
+
+
+def _user_pending_count(user_id: int) -> int:
+    return len(_user_pending_reviews(user_id))
+
+
+def _reviews_word(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        return "запит"
+    if 2 <= count % 10 <= 4 and not (12 <= count % 100 <= 14):
+        return "запити"
+    return "запитів"
+
+
+def _format_pending_users_list(grouped: dict[int, list[dict]]) -> str:
+    if not grouped:
+        return "⏳ Очікують підтвердження: немає запитів."
+    total = sum(len(reviews) for reviews in grouped.values())
+    return (
+        f"⏳ Очікують підтвердження: {total} {_reviews_word(total)} "
+        f"від {len(grouped)} користувача(ів).\n\nОбери, кого перевірити:"
+    )
+
+
+def _format_my_pending_reviews(reviews: list[dict]) -> str:
+    """Список власних запитів користувача, що ще чекають на рішення адміна —
+    без кнопок дій, це лише статус."""
+    if not reviews:
+        return "⏳ У тебе немає записів, що очікують підтвердження."
+    lines = [f"⏳ Очікують підтвердження адміністратора: {len(reviews)} {_reviews_word(len(reviews))}.", ""]
+    for review in reviews:
+        if review["action"] == "delete":
+            values = "видалити запис"
+        else:
+            _, _, day_total = calc_day_total(review["big"], review["small"])
+            values = f"{BIG_LABEL} {review['big']}, {SMALL_LABEL} {review['small']} — {format_money(day_total)} €"
+        lines.append(f"• {review['date_text']}: {values}")
+    return "\n".join(lines)
+
+
+def build_my_pending_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Меню", callback_data="close_entry")]])
+
+
+def build_pending_users_keyboard(grouped: dict[int, list[dict]]) -> InlineKeyboardMarkup:
+    rows = []
+    for uid, reviews in grouped.items():
+        label = reviews[0]["user_label"]
+        rows.append(
+            [InlineKeyboardButton(f"👤 {label} ({len(reviews)})", callback_data=f"review_user_{uid}")]
+        )
+    rows.append([InlineKeyboardButton("🏠 Меню", callback_data="close_entry")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _next_view_after_resolution(review: dict, admin_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Що показати замість щойно обробленого запиту: наступний запит цього ж
+    користувача (щоб адмін підтверджував декілька дат поспіль, по черзі),
+    інакше — згорнутий список користувачів, інакше — що все оброблено."""
+    remaining_same_user = [r for r in _pending_reviews_sorted() if r["user_id"] == review["user_id"]]
+    if remaining_same_user:
+        next_review = remaining_same_user[0]
+        text = _format_review_text(next_review)
+        if len(remaining_same_user) > 1:
+            text += f"\n\n(Ще {len(remaining_same_user) - 1} після цього для {next_review['user_label']})"
+        return text, build_review_keyboard(next_review["id"], include_back=True)
+
+    grouped = _pending_reviews_by_user()
+    if grouped:
+        return _format_pending_users_list(grouped), build_pending_users_keyboard(grouped)
+    return "⏳ Усі запити оброблено.", build_main_menu(user_id=admin_id)
+
+
+async def _refresh_after_action(query: CallbackQuery, admin_id: int, review: dict) -> None:
+    """Після підтвердження/відхилення перемальовує екран перегляду на наступний
+    запит цього ж користувача (або на список користувачів, якщо більше нема
+    що обробляти)."""
+    if query.message is None:
+        return
+    text, keyboard = await _next_view_after_resolution(review, admin_id)
+    await safe_edit(query, text, reply_markup=keyboard)
+
+
+def build_review_keyboard(review_id: str, include_back: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("✅ Підтвердити", callback_data=f"review_approve_{review_id}"),
+            InlineKeyboardButton("❌ Відхилити", callback_data=f"review_reject_{review_id}"),
+        ],
+        [InlineKeyboardButton("✏️ Редагувати", callback_data=f"review_edit_{review_id}")],
+    ]
+    if include_back:
+        rows.append([InlineKeyboardButton("⬅️ До списку користувачів", callback_data="pending_reviews")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _format_review_text(review: dict, status_line: Optional[str] = None) -> str:
+    action_label = {
+        "add": "🆕 Новий запис",
+        "edit": "✏️ Зміна запису",
+        "delete": "🗑 Видалення запису",
+    }[review["action"]]
+    lines = [
+        action_label,
+        f"Користувач: {review['user_label']} (ID {review['user_id']})",
+        f"Дата: {review['date_text']}",
+    ]
+    previous = review.get("previous")
+    if previous is not None:
+        lines.append(f"Було: {BIG_LABEL} {previous[0]}, {SMALL_LABEL} {previous[1]}")
+    if review["action"] == "delete":
+        lines.append("Дія: видалити запис за цей день")
+    else:
+        _, _, day_total = calc_day_total(review["big"], review["small"])
+        label = "Стало" if previous is not None else "Значення"
+        lines.append(f"{label}: {BIG_LABEL} {review['big']}, {SMALL_LABEL} {review['small']}")
+        lines.append(f"Сума за день: {format_money(day_total)} €")
+    if status_line:
+        lines.append("")
+        lines.append(status_line)
+    return "\n".join(lines)
+
+
+# Кому вже пінганули про наявність нових запитів — щоб не засипати адміна
+# повідомленнями, поки він не розгребе чергу. Скидається, щойно черга
+# спорожніє (див. _reset_admin_notifications_if_empty), і наступний новий
+# запит знову надішле сповіщення.
+_notified_admins: set[int] = set()
+
+
+async def _notify_admins_new_review(context: ContextTypes.DEFAULT_TYPE, review: dict) -> None:
+    """Легке сповіщення без деталей і без кнопок: «є новий запит, дивись
+    вкладку». Деталі та дії — тільки через «⏳ Очікують підтвердження» в
+    меню. Поки в адміна лишається бодай один необроблений запит, повторно
+    не турбуємо його новими такими повідомленнями."""
+    text = "🔔 Новий запит на підтвердження.\nПеревір вкладку «⏳ Очікують підтвердження» в меню."
+    for admin_id in ADMIN_IDS:
+        if admin_id in _notified_admins:
+            continue
+        try:
+            await context.bot.send_message(admin_id, text)
+            _notified_admins.add(admin_id)
+        except Exception as error:  # noqa: BLE001 — збій сповіщення не має ламати основний потік
+            logger.warning("Could not notify admin %s about review %s: %s", admin_id, review["id"], error)
+
+
+def _reset_admin_notifications_if_empty() -> None:
+    """Коли черга запитів спорожніла — знімаємо позначку «вже сповіщений»,
+    щоб наступний новий запит знову підняв адмінів."""
+    if _pending_review_count() == 0:
+        _notified_admins.clear()
+
+
+async def _notify_user_result(context: ContextTypes.DEFAULT_TYPE, review: dict, resolution: str) -> None:
+    """resolution: 'approved' | 'rejected' | 'edited'."""
+    user_id = review["user_id"]
+    date_text = review["date_text"]
+
+    if resolution == "rejected":
+        text = f"❌ Ваш запис за {date_text} відхилено адміністратором. Дані не збережено."
+    elif review["action"] == "delete":
+        prefix = "🗑 Ваш запис" if resolution == "approved" else "✏️ Адміністратор видалив ваш запис"
+        text = f"{prefix} за {date_text} видалено."
+    else:
+        _, _, day_total = calc_day_total(review["big"], review["small"])
+        prefix = "✅ Ваш запис" if resolution == "approved" else "✏️ Адміністратор відредагував ваш запис"
+        text = (
+            f"{prefix} за {date_text} підтверджено:\n"
+            f"{BIG_LABEL}: {review['big']}\n"
+            f"{SMALL_LABEL}: {review['small']}\n"
+            f"Сума за день: {format_money(day_total)} €"
+        )
+
+    try:
+        await context.bot.send_message(
+            user_id, text, reply_markup=build_main_menu(user_id=user_id, month=review["month"])
+        )
+    except Exception as error:  # noqa: BLE001 — користувач міг заблокувати бота
+        logger.warning("Could not notify user %s about review %s result: %s", user_id, review["id"], error)
+
+
+# --------------------------------------------------------------------------- #
 # Хендлери: введення дня
 # --------------------------------------------------------------------------- #
 
@@ -697,25 +1320,54 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.message.from_user
     await register_user(user)
     logger.info("[USER:%s] /start (@%s)", user.id, getattr(user, "username", None))
-    await update.message.reply_text(DATE_HINT, reply_markup=build_main_menu(user_id=user.id))
+
+    registered_name = await get_registered_name(user.id)
+    if not registered_name:
+        await send_menu_reply(update, context, 
+            "Вітаю! Перш ніж почати, напиши, будь ласка, своє ім'я та прізвище "
+            "(наприклад: Іван Петренко) — адміністратор бачитиме його в запитах на підтвердження."
+        )
+        return WAIT_REGISTER_NAME
+
+    await send_menu_reply(update, context, DATE_HINT, reply_markup=build_main_menu(user_id=user.id))
+    return WAIT_DATE
+
+
+async def process_registration_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    full_name = re.sub(r"\s+", " ", update.message.text.strip())[:100]
+    has_letters = re.search(r"[^\W\d_]", full_name, re.UNICODE)
+    if len(full_name) < 3 or not has_letters:
+        await send_menu_reply(update, context, 
+            "Введи, будь ласка, ім'я та прізвище словами, наприклад: Іван Петренко"
+        )
+        return WAIT_REGISTER_NAME
+
+    user = update.message.from_user
+    await save_registered_name(user.id, full_name)
+    logger.info("[USER:%s] Registered as %s", user.id, full_name)
+
+    await send_menu_reply(update, context, 
+        f"Дякую, {full_name}! Тепер можна вносити дані.\n\n{DATE_HINT}",
+        reply_markup=build_main_menu(user_id=user.id),
+    )
     return WAIT_DATE
 
 
 async def process_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     raw_date = update.message.text.strip()
     if not DATE_PATTERN.match(raw_date):
-        await update.message.reply_text("Невірний формат. Введи: 15-08-2026")
+        await send_menu_reply(update, context, "Невірний формат. Введи: 15-08-2026")
         return WAIT_DATE
 
     parsed = parse_date_input(raw_date)
     if parsed is None:
-        await update.message.reply_text("Такої дати не існує. Введи: 15-08-2026")
+        await send_menu_reply(update, context, "Такої дати не існує. Введи: 15-08-2026")
         return WAIT_DATE
 
     selected = parsed.date()
     today = today_in_berlin()
     if selected > today:
-        await update.message.reply_text(
+        await send_menu_reply(update, context, 
             f"Не можна вносити дані за майбутні дати. Сьогодні: {today.strftime('%d-%m-%Y')}."
         )
         return WAIT_DATE
@@ -730,49 +1382,47 @@ async def process_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if context.user_data.pop("edit_mode", False):
         record = await read_day(user_id, month, selected.day)
         if record is None:
-            await update.message.reply_text(
+            await send_menu_reply(update, context, 
                 f"Для {selected.strftime('%d-%m-%Y')} записів не знайдено.",
                 reply_markup=build_main_menu(user_id=user_id, month=month),
             )
             return WAIT_DATE
         big_count, small_count = record
-        await update.message.reply_text(
+        await send_menu_reply(update, context, 
             f"Запис {selected.strftime('%d-%m-%Y')}:\n"
-            f"Великі: {big_count}\n"
-            f"Малі: {small_count}\n\n"
-            f"Введи нові значення через пробіл: великі малі\n"
-            f"Наприклад: 200 150\n"
-            f"Щоб видалити запис за цей день — введи: 0 0"
+            f"{BIG_LABEL}: {big_count}\n"
+            f"{SMALL_LABEL}: {small_count}\n\n"
+            f"{EDIT_VALUES_HINT}"
         )
         return WAIT_EDIT_VALUES
 
-    await update.message.reply_text("Великі коробки?")
+    await send_menu_reply(update, context, f"{BIG_LABEL}?")
     return WAIT_BIG
 
 
-async def _read_count(update: Update) -> Optional[int]:
+async def _read_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
     try:
         value = int(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("Введи коректне число.")
+        await send_menu_reply(update, context, "Введи коректне число.")
         return None
     if value < 0:
-        await update.message.reply_text("Кількість не може бути від'ємною.")
+        await send_menu_reply(update, context, "Кількість не може бути від'ємною.")
         return None
     return value
 
 
 async def process_big_boxes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    value = await _read_count(update)
+    value = await _read_count(update, context)
     if value is None:
         return WAIT_BIG
     context.user_data["big_count"] = value
-    await update.message.reply_text("Малі коробки?")
+    await send_menu_reply(update, context, f"{SMALL_LABEL}?")
     return WAIT_SMALL
 
 
 async def process_small_boxes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    value = await _read_count(update)
+    value = await _read_count(update, context)
     if value is None:
         return WAIT_SMALL
 
@@ -788,14 +1438,14 @@ async def process_small_boxes(update: Update, context: ContextTypes.DEFAULT_TYPE
             ]
         ]
     )
-    await update.message.reply_text(
+    await send_menu_reply(update, context, 
         "Перевірка:\n"
         f"Дата: {context.user_data['date_text']}\n"
-        f"Великі коробки: {big_count}\n"
-        f"Малі коробки: {value}\n\n"
+        f"{BIG_LABEL}: {big_count}\n"
+        f"{SMALL_LABEL}: {value}\n\n"
         "Розрахунок:\n"
-        f"Великі: {big_count} × {RATE_BIG} / {SPLIT} = {format_money(big_total)} €\n"
-        f"Малі: {value} × {RATE_SMALL} / {SPLIT} = {format_money(small_total)} €\n"
+        f"{BIG_LABEL}: {big_count} × {RATE_BIG} / {SPLIT} = {format_money(big_total)} €\n"
+        f"{SMALL_LABEL}: {value} × {RATE_SMALL} / {SPLIT} = {format_money(small_total)} €\n"
         f"Сума за день: {format_money(day_total)} €\n\n"
         "Все вірно?",
         reply_markup=keyboard,
@@ -818,6 +1468,7 @@ async def confirm_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     day = context.user_data.get("day")
     big_count = int(context.user_data.get("big_count", 0))
     small_count = int(context.user_data.get("small_count", 0))
+    date_text = context.user_data.get("date_text") or (f"{month}-{day:02d}" if month and day else "")
 
     if month is None or day is None:
         await safe_edit(query, f"Дані втрачено. {DATE_HINT}", reply_markup=build_main_menu(user_id=user_id))
@@ -834,78 +1485,211 @@ async def confirm_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     await register_user(query.from_user)
     big_total, small_total, day_total = calc_day_total(big_count, small_count)
-    await save_day(user_id, month, day, big_count, small_count)
-    monthly_total = await read_month_total(user_id, month)
 
+    if is_admin(user_id):
+        await save_day(user_id, month, day, big_count, small_count)
+        monthly_total = await read_month_total(user_id, month)
+        context.user_data.clear()
+        await safe_edit(
+            query,
+            "✅ Збережено\n"
+            f"{month}-{day:02d}\n"
+            f"{BIG_LABEL}: {big_count} = {format_money(big_total)} €\n"
+            f"{SMALL_LABEL}: {small_count} = {format_money(small_total)} €\n"
+            f"Сума за день: {format_money(day_total)} €\n"
+            f"Разом за місяць: {format_money(monthly_total)} €",
+            reply_markup=build_main_menu(user_id=user_id, month=month),
+        )
+        return WAIT_NEXT_ACTION
+
+    previous = await read_day(user_id, month, day)
+    review = {
+        "id": _new_review_id(),
+        "user_id": user_id,
+        "user_label": await _review_author_label(query.from_user),
+        "month": month,
+        "day": day,
+        "date_text": date_text,
+        "action": "add",
+        "big": big_count,
+        "small": small_count,
+        "previous": previous,
+        "status": "pending",
+        "created_at": datetime.now(BERLIN_TZ).timestamp(),
+    }
+    _pending_reviews[review["id"]] = review
     context.user_data.clear()
+
     await safe_edit(
         query,
-        "✅ Збережено\n"
-        f"{month}-{day:02d}\n"
-        f"Великі: {big_count} = {format_money(big_total)} €\n"
-        f"Малі: {small_count} = {format_money(small_total)} €\n"
-        f"Сума за день: {format_money(day_total)} €\n"
-        f"Разом за місяць: {format_money(monthly_total)} €",
+        "⏳ Надіслано адміністратору на підтвердження\n"
+        f"{date_text}\n"
+        f"{BIG_LABEL}: {big_count}\n"
+        f"{SMALL_LABEL}: {small_count}\n"
+        f"Сума за день: {format_money(day_total)} €",
         reply_markup=build_main_menu(user_id=user_id, month=month),
     )
+    await _notify_admins_new_review(context, review)
+    logger.info(
+        "[USER:%s] Submitted review %s for %s (big=%s small=%s)",
+        user_id, review["id"], date_text, big_count, small_count,
+    )
     return WAIT_NEXT_ACTION
+
+
+EDIT_VALUES_HINT = (
+    f"Введи нові значення через пробіл: «{BIG_LABEL}» «{SMALL_LABEL}»\n"
+    "Наприклад: 200 150\n"
+    "Щоб видалити запис за цей день — введи: 0 0"
+)
 
 
 async def process_edit_values(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     parts = update.message.text.split()
     if len(parts) != 2:
-        await update.message.reply_text("Введи два числа через пробіл: великі малі, наприклад 200 150")
+        await send_menu_reply(update, context, 
+            f"Введи два числа через пробіл: «{BIG_LABEL}» «{SMALL_LABEL}», наприклад 200 150"
+        )
         return WAIT_EDIT_VALUES
     try:
         big_count, small_count = int(parts[0]), int(parts[1])
     except ValueError:
-        await update.message.reply_text("Обидва значення мають бути числами. Наприклад: 200 150")
+        await send_menu_reply(update, context, "Обидва значення мають бути числами. Наприклад: 200 150")
         return WAIT_EDIT_VALUES
     if big_count < 0 or small_count < 0:
-        await update.message.reply_text("Кількість не може бути від'ємною.")
+        await send_menu_reply(update, context, "Кількість не може бути від'ємною.")
         return WAIT_EDIT_VALUES
 
     user_id = update.message.from_user.id
     month = context.user_data.get("month")
     day = context.user_data.get("day")
     if month is None or day is None:
-        await update.message.reply_text(DATE_HINT, reply_markup=build_main_menu(user_id=user_id))
+        await send_menu_reply(update, context, DATE_HINT, reply_markup=build_main_menu(user_id=user_id))
         return WAIT_DATE
 
-    # 0 0 означає "видалити запис за цей день"
+    date_text = context.user_data.get("date_text") or f"{month}-{day:02d}"
+    previous = await read_day(user_id, month, day)
+    context.user_data["edit_new_big"] = big_count
+    context.user_data["edit_new_small"] = small_count
+    context.user_data["edit_previous"] = previous
+
+    lines = [f"Перевірка змін за {date_text}:", ""]
+    if previous is not None:
+        lines.append(f"Було: {BIG_LABEL} {previous[0]}, {SMALL_LABEL} {previous[1]}")
     if big_count == 0 and small_count == 0:
-        removed, remaining = await delete_day(user_id, month, day)
+        lines.append("Стане: запис видалено")
+    else:
+        _, _, day_total = calc_day_total(big_count, small_count)
+        lines.append(f"Стане: {BIG_LABEL} {big_count}, {SMALL_LABEL} {small_count}")
+        lines.append(f"Сума за день: {format_money(day_total)} €")
+    lines.append("")
+    lines.append("Зберегти ці зміни?")
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("💾 Зберегти", callback_data="save_edit"),
+                InlineKeyboardButton("✏️ Відредагувати", callback_data="redo_edit"),
+            ]
+        ]
+    )
+    await send_menu_reply(update, context, "\n".join(lines), reply_markup=keyboard)
+    return WAIT_EDIT_CONFIRM
+
+
+async def confirm_edit_values(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    if query.data == "redo_edit":
+        context.user_data.pop("edit_new_big", None)
+        context.user_data.pop("edit_new_small", None)
+        context.user_data.pop("edit_previous", None)
+        await safe_edit(query, f"Ок. {EDIT_VALUES_HINT}")
+        return WAIT_EDIT_VALUES
+
+    month = context.user_data.get("month")
+    day = context.user_data.get("day")
+    big_count = int(context.user_data.get("edit_new_big", 0))
+    small_count = int(context.user_data.get("edit_new_small", 0))
+    previous = context.user_data.get("edit_previous")
+    date_text = context.user_data.get("date_text") or (f"{month}-{day:02d}" if month and day else "")
+
+    if month is None or day is None:
         context.user_data.clear()
-        if not removed:
-            text = f"Запис за {month}-{day:02d} не знайдено — нічого не змінено."
-        elif remaining == 0:
-            text = (
-                f"🗑 Запис {month}-{day:02d} видалено.\n"
-                f"За {month} більше немає записів — місяць прибрано з меню."
-            )
-        else:
-            monthly_total = await read_month_total(user_id, month)
-            text = (
-                f"🗑 Запис {month}-{day:02d} видалено.\n"
-                f"Днів у місяці лишилось: {remaining}\n"
-                f"Разом за місяць: {format_money(monthly_total)} €"
-            )
-        await update.message.reply_text(
-            text, reply_markup=build_main_menu(user_id=user_id, month=month)
+        await safe_edit(query, DATE_HINT, reply_markup=build_main_menu(user_id=user_id))
+        return WAIT_DATE
+
+    if is_admin(user_id):
+        # 0 0 означає "видалити запис за цей день"
+        if big_count == 0 and small_count == 0:
+            removed, remaining = await delete_day(user_id, month, day)
+            context.user_data.clear()
+            if not removed:
+                text = f"Запис за {month}-{day:02d} не знайдено — нічого не змінено."
+            elif remaining == 0:
+                text = (
+                    f"🗑 Запис {month}-{day:02d} видалено.\n"
+                    f"За {month} більше немає записів — місяць прибрано з меню."
+                )
+            else:
+                monthly_total = await read_month_total(user_id, month)
+                text = (
+                    f"🗑 Запис {month}-{day:02d} видалено.\n"
+                    f"Днів у місяці лишилось: {remaining}\n"
+                    f"Разом за місяць: {format_money(monthly_total)} €"
+                )
+            await safe_edit(query, text, reply_markup=build_main_menu(user_id=user_id, month=month))
+            return WAIT_NEXT_ACTION
+
+        day_total = await save_day(user_id, month, day, big_count, small_count)
+        monthly_total = await read_month_total(user_id, month)
+        context.user_data.clear()
+
+        await safe_edit(
+            query,
+            f"✏️ Оновлено {month}-{day:02d}\n"
+            f"{BIG_LABEL}: {big_count}\n"
+            f"{SMALL_LABEL}: {small_count}\n"
+            f"Сума за день: {format_money(day_total)} €\n"
+            f"Разом за місяць: {format_money(monthly_total)} €",
+            reply_markup=build_main_menu(user_id=user_id, month=month),
         )
         return WAIT_NEXT_ACTION
 
-    day_total = await save_day(user_id, month, day, big_count, small_count)
-    monthly_total = await read_month_total(user_id, month)
+    action = "delete" if (big_count == 0 and small_count == 0) else "edit"
+    review = {
+        "id": _new_review_id(),
+        "user_id": user_id,
+        "user_label": await _review_author_label(query.from_user),
+        "month": month,
+        "day": day,
+        "date_text": date_text,
+        "action": action,
+        "big": big_count,
+        "small": small_count,
+        "previous": previous,
+        "status": "pending",
+        "created_at": datetime.now(BERLIN_TZ).timestamp(),
+    }
+    _pending_reviews[review["id"]] = review
     context.user_data.clear()
 
-    await update.message.reply_text(
-        f"✏️ Оновлено {month}-{day:02d}\n"
-        f"Великі: {big_count}\n"
-        f"Малі: {small_count}\n"
-        f"Сума за день: {format_money(day_total)} €\n"
-        f"Разом за місяць: {format_money(monthly_total)} €",
-        reply_markup=build_main_menu(user_id=user_id, month=month),
+    if action == "delete":
+        text = f"⏳ Запит на видалення запису за {date_text} надіслано адміністратору."
+    else:
+        _, _, day_total = calc_day_total(big_count, small_count)
+        text = (
+            f"⏳ Зміни за {date_text} надіслано адміністратору на підтвердження\n"
+            f"{BIG_LABEL}: {big_count}\n"
+            f"{SMALL_LABEL}: {small_count}\n"
+            f"Сума за день: {format_money(day_total)} €"
+        )
+    await safe_edit(query, text, reply_markup=build_main_menu(user_id=user_id, month=month))
+    await _notify_admins_new_review(context, review)
+    logger.info(
+        "[USER:%s] Submitted review %s for %s (%s)", user_id, review["id"], date_text, action,
     )
     return WAIT_NEXT_ACTION
 
@@ -949,10 +1733,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await safe_edit(query, "Вибери місяць:", reply_markup=build_month_selection_keyboard(months))
         return WAIT_MONTH_INPUT
 
-    if data == "manual_month_total":
-        await safe_edit(query, "Який місяць показати? Введи YYYY-MM")
-        return WAIT_MONTH_INPUT
-
     match = RE_MONTH_TOTAL.match(data)
     if match:
         return await show_month_total(query, context, match.group(1))
@@ -961,11 +1741,57 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if match:
         return await send_month_files(query, context, match.group(1))
 
+    if data == "my_pending_reviews":
+        reviews = _user_pending_reviews(user_id)
+        await safe_edit(query, _format_my_pending_reviews(reviews), reply_markup=build_my_pending_keyboard())
+        return WAIT_NEXT_ACTION
+
+    # --- підтвердження записів адміном ------------------------------------ #
+    if data == "pending_reviews":
+        if not admin:
+            await query.answer("Доступ заборонено", show_alert=True)
+            return WAIT_NEXT_ACTION
+        grouped = _pending_reviews_by_user()
+        await safe_edit(query, _format_pending_users_list(grouped), reply_markup=build_pending_users_keyboard(grouped))
+        return WAIT_NEXT_ACTION
+
+    match = RE_REVIEW_USER.match(data)
+    if match:
+        return await handle_review_open_user(query, context, int(match.group(1)))
+
+    match = RE_REVIEW_APPROVE.match(data)
+    if match:
+        return await handle_review_approve(query, context, match.group(1))
+
+    match = RE_REVIEW_REJECT.match(data)
+    if match:
+        return await handle_review_reject(query, context, match.group(1))
+
+    match = RE_REVIEW_EDIT.match(data)
+    if match:
+        return await handle_review_edit_start(query, context, match.group(1))
+
     # --- адмінські дії ---------------------------------------------------- #
     if data.startswith("admin_") and not admin:
         await query.answer("Доступ заборонено", show_alert=True)
         logger.warning("[USER:%s] Denied admin action: %s", user_id, data)
         return WAIT_NEXT_ACTION
+
+    if data == "admin_monthly_summary":
+        months = await list_months(None)
+        if not months:
+            await query.answer("Поки немає збережених місяців", show_alert=True)
+            return WAIT_NEXT_ACTION
+        await safe_edit(
+            query,
+            "За який місяць зробити зведену таблицю по всіх користувачах?",
+            reply_markup=build_admin_summary_month_keyboard(months),
+        )
+        return WAIT_NEXT_ACTION
+
+    match = RE_ADMIN_SUMMARY.match(data)
+    if match:
+        return await send_monthly_summary(query, match.group(1))
 
     if data in ("admin_users", "admin_log_by_user"):
         users = await known_users()
@@ -975,7 +1801,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         prefix = "admin_user_" if data == "admin_users" else "admin_log_user_"
         rows = []
         for uid, (name, has_data) in users.items():
-            label = f"{uid} — @{name}" if name else str(uid)
+            label = f"{uid} — {name}" if name else str(uid)
             if not has_data:
                 label += " · без даних"
             rows.append([InlineKeyboardButton(label, callback_data=f"{prefix}{uid}")])
@@ -1080,6 +1906,211 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return WAIT_NEXT_ACTION
 
 
+async def handle_review_open_user(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, target_user_id: int) -> int:
+    """Показує перший (найстаріший) запит вибраного користувача з кнопками дій.
+    Якщо в нього декілька дат — після кожної обробленої показується наступна,
+    тож адмін підтверджує/відхиляє їх по черзі, не вертаючись щоразу у список."""
+    if not is_admin(query.from_user.id):
+        await query.answer("Доступ заборонено", show_alert=True)
+        return WAIT_NEXT_ACTION
+
+    reviews = [r for r in _pending_reviews_sorted() if r["user_id"] == target_user_id]
+    if not reviews:
+        await query.answer("У цього користувача більше немає запитів на підтвердження.", show_alert=True)
+        grouped = _pending_reviews_by_user()
+        await safe_edit(query, _format_pending_users_list(grouped), reply_markup=build_pending_users_keyboard(grouped))
+        return WAIT_NEXT_ACTION
+
+    review = reviews[0]
+    text = _format_review_text(review)
+    if len(reviews) > 1:
+        text += f"\n\n(Ще {len(reviews) - 1} після цього для {review['user_label']})"
+    await safe_edit(query, text, reply_markup=build_review_keyboard(review["id"], include_back=True))
+    return WAIT_NEXT_ACTION
+
+
+async def handle_review_approve(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, review_id: str) -> int:
+    admin_id = query.from_user.id
+    if not is_admin(admin_id):
+        await query.answer("Доступ заборонено", show_alert=True)
+        return WAIT_NEXT_ACTION
+
+    async with _lock_for(f"review:{review_id}"):
+        review = _pending_reviews.get(review_id)
+        if review is None or review["status"] != "pending":
+            await query.answer("Цей запит вже оброблено або застарів.", show_alert=True)
+            return WAIT_NEXT_ACTION
+        review["status"] = "approved"
+        review["resolved_by"] = admin_id
+        del _pending_reviews[review_id]  # оброблений запит більше не тримаємо в пам'яті
+    _locks.pop(f"review:{review_id}", None)
+
+    if review["action"] == "delete":
+        await delete_day(review["user_id"], review["month"], review["day"])
+    else:
+        await save_day(review["user_id"], review["month"], review["day"], review["big"], review["small"])
+
+    _reset_admin_notifications_if_empty()
+    await _refresh_after_action(query, admin_id, review)
+    await _notify_user_result(context, review, "approved")
+    logger.info(
+        "[ADMIN:%s] Approved review %s for [USER:%s] %s (%s)",
+        admin_id, review_id, review["user_id"], review["date_text"], review["action"],
+    )
+    return WAIT_NEXT_ACTION
+
+
+async def handle_review_reject(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, review_id: str) -> int:
+    admin_id = query.from_user.id
+    if not is_admin(admin_id):
+        await query.answer("Доступ заборонено", show_alert=True)
+        return WAIT_NEXT_ACTION
+
+    async with _lock_for(f"review:{review_id}"):
+        review = _pending_reviews.get(review_id)
+        if review is None or review["status"] != "pending":
+            await query.answer("Цей запит вже оброблено або застарів.", show_alert=True)
+            return WAIT_NEXT_ACTION
+        review["status"] = "rejected"
+        review["resolved_by"] = admin_id
+        del _pending_reviews[review_id]
+    _locks.pop(f"review:{review_id}", None)
+
+    _reset_admin_notifications_if_empty()
+    await _refresh_after_action(query, admin_id, review)
+    await _notify_user_result(context, review, "rejected")
+    logger.info(
+        "[ADMIN:%s] Rejected review %s for [USER:%s] %s",
+        admin_id, review_id, review["user_id"], review["date_text"],
+    )
+    return WAIT_NEXT_ACTION
+
+
+async def handle_review_edit_start(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, review_id: str) -> int:
+    admin_id = query.from_user.id
+    if not is_admin(admin_id):
+        await query.answer("Доступ заборонено", show_alert=True)
+        return WAIT_NEXT_ACTION
+
+    review = _pending_reviews.get(review_id)
+    if review is None or review["status"] != "pending":
+        await query.answer("Цей запит вже оброблено або застарів.", show_alert=True)
+        return WAIT_NEXT_ACTION
+
+    context.user_data.clear()
+    context.user_data["admin_edit_review_id"] = review_id
+    if query.message is not None:
+        context.user_data["admin_edit_origin_chat_id"] = query.message.chat_id
+        context.user_data["admin_edit_origin_message_id"] = query.message.message_id
+    await safe_edit(
+        query,
+        f"Редагування запису {review['date_text']} для {review['user_label']}.\n\n{BIG_LABEL}?",
+    )
+    return WAIT_ADMIN_EDIT_BIG
+
+
+async def process_admin_edit_big(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = await _read_count(update, context)
+    if value is None:
+        return WAIT_ADMIN_EDIT_BIG
+    context.user_data["admin_edit_big"] = value
+    await send_menu_reply(update, context, f"{SMALL_LABEL}?")
+    return WAIT_ADMIN_EDIT_SMALL
+
+
+async def process_admin_edit_small(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = await _read_count(update, context)
+    if value is None:
+        return WAIT_ADMIN_EDIT_SMALL
+
+    admin_id = update.message.from_user.id
+    review_id = context.user_data.get("admin_edit_review_id")
+    review = _pending_reviews.get(review_id) if review_id else None
+    if review is None or review["status"] != "pending":
+        context.user_data.clear()
+        await send_menu_reply(update, context, 
+            "Цей запит вже оброблено або застарів.",
+            reply_markup=build_main_menu(user_id=admin_id),
+        )
+        return WAIT_NEXT_ACTION
+
+    big_count = int(context.user_data.get("admin_edit_big", 0))
+    small_count = value
+    context.user_data["admin_edit_small"] = small_count
+    _, _, day_total = calc_day_total(big_count, small_count)
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("💾 Зберегти", callback_data="review_edit_save"),
+                InlineKeyboardButton("❌ Скасувати", callback_data="review_edit_cancel"),
+            ]
+        ]
+    )
+    await send_menu_reply(update, context, 
+        f"Новий варіант запису {review['date_text']} для {review['user_label']}:\n"
+        f"{BIG_LABEL}: {big_count}\n"
+        f"{SMALL_LABEL}: {small_count}\n"
+        f"Сума за день: {format_money(day_total)} €\n\n"
+        "Зберегти?",
+        reply_markup=keyboard,
+    )
+    return WAIT_ADMIN_EDIT_CONFIRM
+
+
+async def admin_edit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    admin_id = query.from_user.id
+
+    if query.data == "review_edit_cancel":
+        context.user_data.clear()
+        await safe_edit(query, "Скасовано. Запит усе ще очікує підтвердження в списку вище.")
+        return WAIT_NEXT_ACTION
+
+    review_id = context.user_data.get("admin_edit_review_id")
+    big_count = int(context.user_data.get("admin_edit_big", 0))
+    small_count = int(context.user_data.get("admin_edit_small", 0))
+    origin_chat_id = context.user_data.get("admin_edit_origin_chat_id")
+    origin_message_id = context.user_data.get("admin_edit_origin_message_id")
+    context.user_data.clear()
+
+    async with _lock_for(f"review:{review_id}"):
+        review = _pending_reviews.get(review_id)
+        if review is None or review["status"] != "pending":
+            await safe_edit(query, "Цей запит вже оброблено іншим адміном.")
+            return WAIT_NEXT_ACTION
+        review["status"] = "edited"
+        review["resolved_by"] = admin_id
+        review["big"] = big_count
+        review["small"] = small_count
+        review["action"] = "delete" if (big_count == 0 and small_count == 0) else "edit"
+        del _pending_reviews[review_id]
+    _locks.pop(f"review:{review_id}", None)
+
+    if review["action"] == "delete":
+        await delete_day(review["user_id"], review["month"], review["day"])
+    else:
+        await save_day(review["user_id"], review["month"], review["day"], big_count, small_count)
+
+    _reset_admin_notifications_if_empty()
+    if origin_chat_id is not None and origin_message_id is not None:
+        text, keyboard = await _next_view_after_resolution(review, admin_id)
+        try:
+            await context.bot.edit_message_text(
+                chat_id=origin_chat_id, message_id=origin_message_id, text=text, reply_markup=keyboard
+            )
+        except Exception as error:  # noqa: BLE001 — це лише зручність навігації, не критично
+            logger.debug("Could not advance origin review screen: %s", error)
+    await _notify_user_result(context, review, "edited")
+    logger.info(
+        "[ADMIN:%s] Edited review %s for [USER:%s] %s -> big=%s small=%s",
+        admin_id, review_id, review["user_id"], review["date_text"], big_count, small_count,
+    )
+    await safe_edit(query, "Збережено, користувача повідомлено.")
+    return WAIT_NEXT_ACTION
+
+
 async def show_month_total(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, month: str) -> int:
     user_id = query.from_user.id
     admin_target = context.user_data.pop("admin_view_user", None) if is_admin(user_id) else None
@@ -1122,10 +2153,34 @@ async def send_month_files(query: CallbackQuery, context: ContextTypes.DEFAULT_T
     return WAIT_NEXT_ACTION
 
 
+async def send_monthly_summary(query: CallbackQuery, month: str) -> int:
+    """Зведена таблиця за місяць: один рядок на користувача (коробки кожного
+    типу, разом і сума), відсортовано за алфавітом — для швидкого огляду адміном."""
+    admin_id = query.from_user.id
+    path = await build_monthly_summary(month)
+    if path is None:
+        await query.answer(f"За {month} ще немає жодних даних.", show_alert=True)
+        return WAIT_NEXT_ACTION
+
+    try:
+        with open(path, "rb") as fh:
+            await query.message.reply_document(document=fh, filename=f"Зведення_{month}.xlsx")
+        logger.info("[ADMIN:%s] Sent monthly summary for %s", admin_id, month)
+    except (OSError, BadRequest) as error:
+        logger.exception("[ADMIN:%s] Failed to send monthly summary for %s: %s", admin_id, month, error)
+        await query.message.reply_text("Не вдалося надіслати таблицю. Спробуй ще раз.")
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    return WAIT_NEXT_ACTION
+
+
 async def process_month_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     month = update.message.text.strip()
     if not MONTH_PATTERN.match(month):
-        await update.message.reply_text("Невірний формат місяця. Введи YYYY-MM, наприклад 2026-08.")
+        await send_menu_reply(update, context, "Невірний формат місяця. Введи YYYY-MM, наприклад 2026-08.")
         return WAIT_MONTH_INPUT
 
     user_id = update.message.from_user.id
@@ -1134,12 +2189,12 @@ async def process_month_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     if is_admin(user_id) and admin_target is None:
         total, names = await read_all_totals(month)
         if not names:
-            await update.message.reply_text(
+            await send_menu_reply(update, context, 
                 f"За місяць {month} ще немає записів.",
                 reply_markup=build_main_menu(user_id=user_id, month=month),
             )
             return WAIT_NEXT_ACTION
-        await update.message.reply_text(
+        await send_menu_reply(update, context, 
             f"Усі користувачі за {month}: {format_money(total)} €\nФайли: {', '.join(names)}",
             reply_markup=build_main_menu(user_id=user_id, month=month),
         )
@@ -1148,7 +2203,7 @@ async def process_month_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     target_id = admin_target if admin_target is not None else user_id
     path = user_file(target_id, month)
     if not _month_has_data_sync(path):
-        await update.message.reply_text(
+        await send_menu_reply(update, context, 
             f"За місяць {month} ще немає записів.",
             reply_markup=build_main_menu(user_id=user_id, month=month),
         )
@@ -1156,7 +2211,7 @@ async def process_month_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     total = await read_month_total(target_id, month)
     context.user_data["download_user"] = target_id
-    await update.message.reply_text(
+    await send_menu_reply(update, context, 
         f"{month}: {format_money(total)} €\nФайл: {path.name}",
         reply_markup=build_month_result_keyboard(month),
     )
@@ -1172,33 +2227,33 @@ async def cmd_total(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     month = args[0].strip() if args else current_month()
     if not MONTH_PATTERN.match(month):
-        await update.message.reply_text("Формат: /total 2026-08")
+        await send_menu_reply(update, context, "Формат: /total 2026-08")
         return
 
     user_id = update.message.from_user.id
     if is_admin(user_id):
         total, names = await read_all_totals(month)
         if not names:
-            await update.message.reply_text(f"За місяць {month} ще немає записів.")
+            await send_menu_reply(update, context, f"За місяць {month} ще немає записів.")
             return
-        await update.message.reply_text(
+        await send_menu_reply(update, context, 
             f"Усі користувачі за {month}: {format_money(total)} €\nФайли: {', '.join(names)}"
         )
         return
 
     path = user_file(user_id, month)
     if not _month_has_data_sync(path):
-        await update.message.reply_text(f"За місяць {month} ще немає записів.")
+        await send_menu_reply(update, context, f"За місяць {month} ще немає записів.")
         return
     total = await read_month_total(user_id, month)
-    await update.message.reply_text(f"{month}: {format_money(total)} €\nФайл: {path.name}")
+    await send_menu_reply(update, context, f"{month}: {format_money(total)} €\nФайл: {path.name}")
 
 
 async def cmd_logtail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/logtail [N|file] — тільки для адмінів."""
     user_id = update.message.from_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("Доступ заборонено.")
+        await send_menu_reply(update, context, "Доступ заборонено.")
         logger.warning("[USER:%s] Denied /logtail", user_id)
         return
 
@@ -1206,7 +2261,7 @@ async def cmd_logtail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if mode == "file":
         if not LOG_FILE.exists():
-            await update.message.reply_text("Файл лога не знайдено.")
+            await send_menu_reply(update, context, "Файл лога не знайдено.")
             return
         with open(LOG_FILE, "rb") as fh:
             await update.message.reply_document(document=fh, filename=LOG_FILE.name)
@@ -1220,7 +2275,7 @@ async def cmd_logtail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     result = await tail_log(lines)
     if not result:
-        await update.message.reply_text("Лог порожній.")
+        await send_menu_reply(update, context, "Лог порожній.")
         return
 
     text = "\n".join(result)
@@ -1236,13 +2291,13 @@ async def cmd_logtail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except OSError:
                 pass
     else:
-        await update.message.reply_text(f"Останні {len(result)} рядків лога:\n\n{text}")
+        await send_menu_reply(update, context, f"Останні {len(result)} рядків лога:\n\n{text}")
     logger.info("[ADMIN:%s] Requested log tail (%d lines)", user_id, len(result))
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    await update.message.reply_text("Скасовано. Для нового запису натисни /start.")
+    await send_menu_reply(update, context, "Скасовано. Для нового запису натисни /start.")
     return ConversationHandler.END
 
 
@@ -1275,6 +2330,63 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # --------------------------------------------------------------------------- #
 
 
+async def _post_init(application: Application) -> None:
+    """Налаштовує список команд, який Telegram показує в кнопці «Меню» біля
+    поля вводу (те саме, що BotFather /setcommands). Адмінам показуємо ще й
+    /logtail — окремою «областю видимості» лише для їхніх особистих чатів."""
+    default_commands = [
+        BotCommand("start", "Почати"),
+        BotCommand("menu", "Головне меню"),
+        BotCommand("total", "Сума за поточний місяць"),
+        BotCommand("cancel", "Скасувати поточну дію"),
+    ]
+    try:
+        await application.bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
+    except Exception as error:  # noqa: BLE001 — відсутність меню команд не критична
+        logger.warning("Could not set default command menu: %s", error)
+
+    admin_commands = default_commands + [BotCommand("logtail", "Останні рядки логів (адмін)")]
+    for admin_id in ADMIN_IDS:
+        try:
+            await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception as error:  # noqa: BLE001 — адмін міг ще жодного разу не писати боту
+            logger.warning("Could not set admin command menu for %s: %s", admin_id, error)
+
+
+class PerChatUpdateProcessor(BaseUpdateProcessor):
+    """Апдейти різних чатів обробляються паралельно (до max_concurrent_updates
+    одночасно) — щоб один активний користувач не змушував решту команди
+    чекати в черзі. Апдейти ОДНОГО чату обробляються строго послідовно, щоб
+    діалоговий стан того самого користувача не зіткнувся сам із собою —
+    штатний concurrent_updates=True такого не гарантує (апдейти одного чату
+    теж могли б піти паралельно)."""
+
+    def __init__(self, max_concurrent_updates: int) -> None:
+        super().__init__(max_concurrent_updates)
+        self._chat_locks: dict[int, asyncio.Lock] = {}
+
+    def _lock_for_chat(self, chat_id: int) -> asyncio.Lock:
+        lock = self._chat_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._chat_locks[chat_id] = lock
+        return lock
+
+    async def do_process_update(self, update: object, coroutine) -> None:
+        chat = getattr(update, "effective_chat", None)
+        if chat is None:
+            await coroutine
+            return
+        async with self._lock_for_chat(chat.id):
+            await coroutine
+
+    async def initialize(self) -> None:
+        pass
+
+    async def shutdown(self) -> None:
+        pass
+
+
 def main() -> None:
     token = BOT_TOKEN or os.getenv("BOT_TOKEN")
     if not token or token == "YOUR_BOT_TOKEN_HERE":
@@ -1290,7 +2402,13 @@ def main() -> None:
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
-    application = Application.builder().token(token).build()
+    application = (
+        Application.builder()
+        .token(token)
+        .concurrent_updates(PerChatUpdateProcessor(32))
+        .post_init(_post_init)
+        .build()
+    )
 
     callback_handler = CallbackQueryHandler(on_callback, pattern=CALLBACK_PATTERN)
 
@@ -1315,6 +2433,26 @@ def main() -> None:
             ],
             WAIT_EDIT_VALUES: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, process_edit_values),
+                callback_handler,
+            ],
+            WAIT_EDIT_CONFIRM: [
+                CallbackQueryHandler(confirm_edit_values, pattern=r"^(save_edit|redo_edit)$"),
+                callback_handler,
+            ],
+            WAIT_REGISTER_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_registration_name),
+                callback_handler,
+            ],
+            WAIT_ADMIN_EDIT_BIG: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_admin_edit_big),
+                callback_handler,
+            ],
+            WAIT_ADMIN_EDIT_SMALL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_admin_edit_small),
+                callback_handler,
+            ],
+            WAIT_ADMIN_EDIT_CONFIRM: [
+                CallbackQueryHandler(admin_edit_confirm, pattern=r"^(review_edit_save|review_edit_cancel)$"),
                 callback_handler,
             ],
             WAIT_MONTH_INPUT: [
