@@ -94,40 +94,54 @@ BOT_TOKEN: Optional[str] = _setting("BOT_TOKEN", None)
 # Ставки. Виносяться в config.py, якщо треба змінити без правки коду.
 RATE_BIG = Decimal(str(_setting("RATE_BIG", "0.90")))
 RATE_SMALL = Decimal(str(_setting("RATE_SMALL", "0.70")))
-SPLIT = Decimal(str(_setting("SPLIT", "2")))  # ділимо заробіток навпіл
 
 # --------------------------------------------------------------------------- #
-# Категорії виробу
+# Категорії виробу та ставки
 #
 # На виробництві три групи виробів (коробки, winkel, dekel), кожна у двох
 # розмірах — 177 і 161. Людина за день може робити кілька категорій поспіль
 # (почала з коробок, перейшла на winkel), тому день зберігає лічильник по
-# кожній категорії окремо, а не дві цифри, як було раніше.
+# кожній категорії окремо.
 #
-# Ставки беруться з config.py; за замовчуванням winkel і dekel рахуються за
-# тими самими ставками, що й коробки — ПОСТАВ СВОЇ, якщо вони інші:
-#     RATE_WINKEL_177 = "1.10"
-# Додати ще одну категорію = дописати рядок сюди; формат файлів, звіти та
-# екрани вводу підлаштуються самі.
+# Ділення на 2 — це не властивість ставки, а кількість людей на операції:
+# коробки й winkel роблять удвох, тож оплата за штуку ділиться між двома;
+# dekel робить одна людина і отримує повну ставку. Саме тому число робітників
+# задається на категорію, а не одним спільним множником:
+#     Коробки 177:  100 × 0.90 / 2 = 45.00 €   (удвох)
+#     Winkel 161:   100 × 0.35 / 2 = 17.50 €   (удвох)
+#     Dekel 177:    100 × 0.30     = 30.00 €   (сам)
+#
+# Ставки перекриваються в config.py без правки коду:
+#     RATE_WINKEL_177 = "0.40"
+# Якщо на якійсь операції зміниться склад бригади — там же:
+#     WORKERS_DEKEL_177 = "2"
+# Додати ще одну категорію = дописати рядок у CATEGORY_DEFS; формат файлів,
+# звіти та екрани вводу підлаштуються самі.
 # --------------------------------------------------------------------------- #
 
 CATEGORY_DEFS = [
-    ("box_177", "Коробки 177", "RATE_BOX_177", RATE_BIG),
-    ("box_161", "Коробки 161", "RATE_BOX_161", RATE_SMALL),
-    ("winkel_177", "Winkel 177", "RATE_WINKEL_177", RATE_BIG),
-    ("winkel_161", "Winkel 161", "RATE_WINKEL_161", RATE_SMALL),
-    ("dekel_177", "Dekel 177", "RATE_DEKEL_177", RATE_BIG),
-    ("dekel_161", "Dekel 161", "RATE_DEKEL_161", RATE_SMALL),
+    # ключ,        назва,          ставка за штуку, людей на операції
+    ("box_177",    "Коробки 177",  RATE_BIG,        2),
+    ("box_161",    "Коробки 161",  RATE_SMALL,      2),
+    ("winkel_177", "Winkel 177",   Decimal("0.35"), 2),
+    ("winkel_161", "Winkel 161",   Decimal("0.35"), 2),
+    ("dekel_177",  "Dekel 177",    Decimal("0.30"), 1),
+    ("dekel_161",  "Dekel 161",    Decimal("0.20"), 1),
 ]
 
-CATEGORY_KEYS = [key for key, _label, _setting_name, _default in CATEGORY_DEFS]
+CATEGORY_KEYS = [key for key, _label, _rate, _workers in CATEGORY_DEFS]
 CATEGORY_LABELS = {
     key: str(_setting(f"LABEL_{key.upper()}", label))
-    for key, label, _setting_name, _default in CATEGORY_DEFS
+    for key, label, _rate, _workers in CATEGORY_DEFS
 }
 CATEGORY_RATES = {
-    key: Decimal(str(_setting(setting_name, str(default))))
-    for key, _label, setting_name, default in CATEGORY_DEFS
+    key: Decimal(str(_setting(f"RATE_{key.upper()}", str(rate))))
+    for key, _label, rate, _workers in CATEGORY_DEFS
+}
+# Скільки людей ділять оплату за цю операцію (1 = працює сам, повна ставка).
+CATEGORY_WORKERS = {
+    key: Decimal(str(_setting(f"WORKERS_{key.upper()}", str(workers))))
+    for key, _label, _rate, workers in CATEGORY_DEFS
 }
 CATEGORY_COUNT = len(CATEGORY_KEYS)
 EMPTY_COUNTS = tuple(0 for _ in CATEGORY_KEYS)
@@ -174,7 +188,7 @@ TELEGRAM_TEXT_LIMIT = 3500  # запас до ліміту 4096
 # іменем користувача поруч з його id (див. user_tag).
 # Позначка збірки: видно в першому рядку лога після старту. Якщо після заміни
 # файлу дата тут стара — значить, працює старий процес і бот не перезапустився.
-BOT_VERSION = "2026-08-21 · категорії, доступ, кнопки «Назад»"
+BOT_VERSION = "2026-08-21 · категорії, ставки winkel/dekel, доступ, кнопки «Назад»"
 
 LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
 LOG_DATE_FORMAT = "%d.%m.%Y %H:%M:%S"
@@ -262,7 +276,7 @@ def normalize_counts(counts) -> tuple[int, ...]:
 
 
 def category_money(key: str, count: int) -> Decimal:
-    return money(Decimal(int(count)) * CATEGORY_RATES[key] / SPLIT)
+    return money(Decimal(int(count)) * CATEGORY_RATES[key] / CATEGORY_WORKERS[key])
 
 
 def calc_day_total(counts) -> tuple[dict[str, Decimal], Decimal]:
@@ -287,12 +301,29 @@ def counts_summary(counts, only_filled: bool = True) -> str:
     return ", ".join(parts) if parts else "—"
 
 
+def rate_formula(key: str, count: int) -> str:
+    """«100 × 0.35 / 2» або «100 × 0.30» — ділення показуємо лише там, де воно є."""
+    workers = CATEGORY_WORKERS[key]
+    tail = f" / {workers}" if workers != 1 else ""
+    return f"{count} × {CATEGORY_RATES[key]}{tail}"
+
+
+def rate_hint(key: str) -> str:
+    """Коротко про ставку: «0.35 € на двох» або «0.30 €»."""
+    workers = CATEGORY_WORKERS[key]
+    if workers == 1:
+        return f"{format_money(CATEGORY_RATES[key])} €"
+    if workers == 2:
+        return f"{format_money(CATEGORY_RATES[key])} € на двох"
+    return f"{format_money(CATEGORY_RATES[key])} € на {workers}"
+
+
 def counts_lines(counts, only_filled: bool = True) -> list[str]:
     """Те саме, але окремими рядками — для екранів перевірки та звітів."""
     values = normalize_counts(counts)
     per_category, _ = calc_day_total(values)
     return [
-        f"{CATEGORY_LABELS[key]}: {count} × {CATEGORY_RATES[key]} / {SPLIT} = {format_money(per_category[key])} €"
+        f"{CATEGORY_LABELS[key]}: {rate_formula(key, count)} = {format_money(per_category[key])} €"
         for key, count in zip(CATEGORY_KEYS, values)
         if count or not only_filled
     ]
@@ -966,9 +997,7 @@ def _build_user_report_sync(path: Path, month: str, display_name: str = "") -> O
     if display_name:
         subtitle_parts.append(display_name)
     subtitle_parts.append(
-        "Ставки: "
-        + " · ".join(f"{CATEGORY_LABELS[key]} {format_money(CATEGORY_RATES[key])} €" for key in used_keys)
-        + f" · поділ на {SPLIT}"
+        "Ставки: " + " · ".join(f"{CATEGORY_LABELS[key]} {rate_hint(key)}" for key in used_keys)
     )
     sheet.merge_cells(f"A2:{last_letter}2")
     subtitle = sheet.cell(row=2, column=1, value="   |   ".join(subtitle_parts))
@@ -3377,7 +3406,10 @@ def main() -> None:
     logger.info("─" * 60)
     logger.info("Бот запущено. Версія: %s", BOT_VERSION)
     logger.info("Адміни: %s", ", ".join(str(a) for a in sorted(ADMIN_IDS)))
-    logger.info("Категорії: %s", ", ".join(CATEGORY_LABELS[key] for key in CATEGORY_KEYS))
+    logger.info(
+        "Ставки: %s",
+        " · ".join(f"{CATEGORY_LABELS[key]} {rate_hint(key)}" for key in CATEGORY_KEYS),
+    )
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
