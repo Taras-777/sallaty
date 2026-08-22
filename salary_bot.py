@@ -157,9 +157,22 @@ SMALL_LABEL = CATEGORY_LABELS["box_161"]
 # мовчки віддав би права адміна чужому Telegram ID. Перевірка при старті.
 _raw_admins = _setting("ADMIN_IDS", "")
 if isinstance(_raw_admins, (set, list, tuple)):
-    ADMIN_IDS = {int(x) for x in _raw_admins}
+    ADMIN_ID_ORDER = [int(x) for x in _raw_admins]
 else:
-    ADMIN_IDS = {int(x) for x in re.findall(r"\d+", str(_raw_admins))}
+    ADMIN_ID_ORDER = [int(x) for x in re.findall(r"\d+", str(_raw_admins))]
+ADMIN_IDS = set(ADMIN_ID_ORDER)
+
+# Головний адмін — власник даних. Йому (і тільки йому) йдуть резервні копії:
+# в архіві лежать заробітки всієї команди, тож роздавати його кожному, хто
+# має право підтверджувати записи, не варто. За замовчуванням це перший id у
+# ADMIN_IDS; можна задати явно: OWNER_ID = 442336138 у config.py.
+_raw_owner = _setting("OWNER_ID", ADMIN_ID_ORDER[0] if ADMIN_ID_ORDER else 0)
+try:
+    OWNER_ID: Optional[int] = int(str(_raw_owner).strip() or 0) or None
+except ValueError:
+    OWNER_ID = ADMIN_ID_ORDER[0] if ADMIN_ID_ORDER else None
+if OWNER_ID is not None:
+    ADMIN_IDS.add(OWNER_ID)  # власник завжди має права адміна
 
 BERLIN_TZ = ZoneInfo(str(_setting("TIMEZONE", "Europe/Berlin")))
 
@@ -193,7 +206,7 @@ TELEGRAM_TEXT_LIMIT = 3500  # запас до ліміту 4096
 # іменем користувача поруч з його id (див. user_tag).
 # Позначка збірки: видно в першому рядку лога після старту. Якщо після заміни
 # файлу дата тут стара — значить, працює старий процес і бот не перезапустився.
-BOT_VERSION = "2026-08-22 · щоденний бекап у Telegram, історія змін"
+BOT_VERSION = "2026-08-22 · бекап головному адміну, історія змін"
 
 LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
 LOG_DATE_FORMAT = "%d.%m.%Y %H:%M:%S"
@@ -1587,6 +1600,11 @@ async def filter_log(marker: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
+def is_owner(user_id: Optional[int]) -> bool:
+    """Головний адмін: отримує резервні копії та може викликати /backup."""
+    return user_id is not None and OWNER_ID is not None and user_id == OWNER_ID
+
+
 def is_admin(user_id: Optional[int]) -> bool:
     return user_id is not None and user_id in ADMIN_IDS
 
@@ -2141,6 +2159,9 @@ async def _stale_reviews_watcher(application: Application) -> None:
 # жодних ключів, бакетів і сторонніх сервісів.
 #
 # Налаштування в config.py:
+# Архів отримує лише головний адмін (OWNER_ID) — решта адмінів підтверджують
+# записи, але вивантажувати дані всієї команди їм не треба.
+#
 #     BACKUP_ENABLED = False     вимкнути
 #     BACKUP_HOUR = 23           о котрій годині (за Берліном)
 #     BACKUP_INCLUDE_LOG = True  класти в архів ще й лог
@@ -2208,13 +2229,15 @@ async def send_backup(bot, reason: str = "щоденний") -> bool:
 
     delivered = False
     try:
-        for admin_id in ADMIN_IDS:
+        if OWNER_ID is None:
+            logger.warning("Бекап нікуди надсилати: OWNER_ID не задано")
+        else:
             try:
                 with open(archive, "rb") as fh:
-                    await bot.send_document(admin_id, document=fh, filename=archive.name[1:], caption=caption)
+                    await bot.send_document(OWNER_ID, document=fh, filename=archive.name[1:], caption=caption)
                 delivered = True
-            except Exception as error:  # noqa: BLE001 — недоступний адмін не має зривати бекап
-                logger.warning("Не вдалося надіслати бекап адміну %s: %s", admin_id, error)
+            except Exception as error:  # noqa: BLE001 — тимчасова недоступність не має валити цикл
+                logger.warning("Не вдалося надіслати бекап власнику %s: %s", OWNER_ID, error)
     finally:
         try:
             archive.unlink()
@@ -2256,10 +2279,14 @@ async def _backup_watcher(application: Application) -> None:
 
 
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/backup — зібрати й надіслати копію просто зараз (тільки адмін)."""
+    """/backup — зібрати й надіслати копію просто зараз (тільки головний адмін)."""
     user_id = update.message.from_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("Доступ заборонено.")
+    if not is_owner(user_id):
+        await update.message.reply_text(
+            "Резервні копії доступні лише головному адміну."
+            if is_admin(user_id)
+            else "Доступ заборонено."
+        )
         logger.warning("%s — спроба /backup без прав", user_tag(user_id))
         return
 
@@ -3605,13 +3632,12 @@ async def _post_init(application: Application) -> None:
     except Exception as error:  # noqa: BLE001 — відсутність меню команд не критична
         logger.warning("Could not set default command menu: %s", error)
 
-    admin_commands = default_commands + [
-        BotCommand("logtail", "Останні рядки логів (адмін)"),
-        BotCommand("backup", "Резервна копія даних (адмін)"),
-    ]
+    admin_commands = default_commands + [BotCommand("logtail", "Останні рядки логів (адмін)")]
+    owner_commands = admin_commands + [BotCommand("backup", "Резервна копія даних")]
     for admin_id in ADMIN_IDS:
+        commands = owner_commands if is_owner(admin_id) else admin_commands
         try:
-            await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+            await application.bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=admin_id))
         except Exception as error:  # noqa: BLE001 — адмін міг ще жодного разу не писати боту
             logger.warning("Could not set admin command menu for %s: %s", admin_id, error)
 
@@ -3775,6 +3801,7 @@ def main() -> None:
     logger.info("─" * 60)
     logger.info("Бот запущено. Версія: %s", BOT_VERSION)
     logger.info("Адміни: %s", ", ".join(str(a) for a in sorted(ADMIN_IDS)))
+    logger.info("Головний адмін (бекапи): %s", OWNER_ID if OWNER_ID else "не задано")
     logger.info(
         "Ставки: %s",
         " · ".join(f"{CATEGORY_LABELS[key]} {rate_hint(key)}" for key in CATEGORY_KEYS),
@@ -4128,6 +4155,36 @@ class BackupTests(unittest.TestCase):
             archive.unlink()
         self.assertNotIn("report_9970_2026-08.xlsx", names, "тимчасові звіти в бекап не йдуть")
         self.assertNotIn("users.json.tmp", names)
+
+    def test_backup_goes_only_to_owner(self):
+        """Архів з даними всієї команди отримує лише головний адмін."""
+        sent = []
+
+        class FakeBot:
+            async def send_document(self, chat_id, document=None, filename=None, caption=None):
+                document.read()
+                sent.append(chat_id)
+
+        original_admins, original_owner = sb.ADMIN_IDS, sb.OWNER_ID
+        sb.ADMIN_IDS = {111, 222, 333}
+        sb.OWNER_ID = 111
+        try:
+            asyncio.run(sb.send_backup(FakeBot()))
+        finally:
+            sb.ADMIN_IDS, sb.OWNER_ID = original_admins, original_owner
+
+        self.assertEqual(sent, [111], "решта адмінів копію отримувати не мають")
+
+    def test_only_owner_may_request_backup(self):
+        original_admins, original_owner = sb.ADMIN_IDS, sb.OWNER_ID
+        sb.ADMIN_IDS = {111, 222}
+        sb.OWNER_ID = 111
+        try:
+            self.assertTrue(sb.is_owner(111))
+            self.assertFalse(sb.is_owner(222), "другий адмін не власник")
+            self.assertTrue(sb.is_admin(222), "але адмінські права в нього лишаються")
+        finally:
+            sb.ADMIN_IDS, sb.OWNER_ID = original_admins, original_owner
 
     def test_backup_runs_once_a_day(self):
         from datetime import datetime as dt
