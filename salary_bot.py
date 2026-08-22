@@ -39,8 +39,10 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 import re
+import sys
 import uuid
 from collections import deque
+from contextlib import asynccontextmanager
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -150,7 +152,9 @@ EMPTY_COUNTS = tuple(0 for _ in CATEGORY_KEYS)
 BIG_LABEL = CATEGORY_LABELS["box_177"]
 SMALL_LABEL = CATEGORY_LABELS["box_161"]
 
-_raw_admins = _setting("ADMIN_IDS", "442336138")
+# Порожній список за замовчуванням: інакше бот, розгорнутий без config.py,
+# мовчки віддав би права адміна чужому Telegram ID. Перевірка при старті.
+_raw_admins = _setting("ADMIN_IDS", "")
 if isinstance(_raw_admins, (set, list, tuple)):
     ADMIN_IDS = {int(x) for x in _raw_admins}
 else:
@@ -188,7 +192,7 @@ TELEGRAM_TEXT_LIMIT = 3500  # запас до ліміту 4096
 # іменем користувача поруч з його id (див. user_tag).
 # Позначка збірки: видно в першому рядку лога після старту. Якщо після заміни
 # файлу дата тут стара — значить, працює старий процес і бот не перезапустився.
-BOT_VERSION = "2026-08-21 · категорії, ставки winkel/dekel, доступ, кнопки «Назад»"
+BOT_VERSION = "2026-08-22 · історія змін, статистика по користувачу"
 
 LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
 LOG_DATE_FORMAT = "%d.%m.%Y %H:%M:%S"
@@ -354,6 +358,28 @@ def current_month() -> str:
 # --------------------------------------------------------------------------- #
 
 _locks: dict[str, asyncio.Lock] = {}
+_lock_users: dict[str, int] = {}  # скільки корутин зараз тримає або чекає лок
+
+
+@asynccontextmanager
+async def file_lock(key: str):
+    """Лок на файл, який сам прибирається за собою.
+
+    Раніше словник _locks ріс на кожен новий {user_id}_{month}.xlsx і ніколи не
+    порожнів. Рахуємо охочих ДО захоплення — тобто і тих, хто зараз чекає в
+    черзі; поки лічильник не впав до нуля, об\'єкт лока лишається той самий,
+    інакше двоє могли б захопити різні локи на один файл.
+    """
+    lock = _lock_for(key)
+    _lock_users[key] = _lock_users.get(key, 0) + 1
+    try:
+        async with lock:
+            yield
+    finally:
+        _lock_users[key] -= 1
+        if _lock_users[key] <= 0:
+            _lock_users.pop(key, None)
+            _locks.pop(key, None)
 
 
 def _lock_for(key: str) -> asyncio.Lock:
@@ -519,11 +545,55 @@ def _rows_from_sheet(sheet) -> list[tuple[str, tuple[int, ...], Decimal]]:
     return rows
 
 
-def _save_day_sync(path: Path, date_value: str, counts) -> Decimal:
+HISTORY_SHEET = "Історія"
+HISTORY_COLUMNS = ["Коли", "День", "Дія", "Було", "Стало", "Сума за день, €", "Вніс", "Підтвердив"]
+
+
+def _append_history(workbook, date_value: str, action: str, before, after, author: str, approved_by: str) -> None:
+    """Дописує рядок в аркуш «Історія» тієї ж книги.
+
+    Пишеться в межах того самого збереження, що й сам запис, — тож або
+    зміниться і день, і історія, або нічого. Excel зберігає лише останній стан
+    дня, і без цього аркуша суперечку «я вносив 200, а стоїть 150» немає чим
+    закрити, крім грепу по логах.
+    """
+    if HISTORY_SHEET in workbook.sheetnames:
+        sheet = workbook[HISTORY_SHEET]
+    else:
+        sheet = workbook.create_sheet(HISTORY_SHEET)
+        sheet.append(HISTORY_COLUMNS)
+        for cell in sheet[1]:
+            cell.font = Font(bold=True)
+        for index, width in enumerate([17, 12, 22, 34, 34, 15, 22, 22], start=1):
+            sheet.column_dimensions[get_column_letter(index)].width = width
+        sheet.freeze_panes = "A2"
+
+    after_counts = normalize_counts(after) if after is not None else EMPTY_COUNTS
+    row = [
+        datetime.now(BERLIN_TZ).strftime("%d.%m.%Y %H:%M"),
+        _human_date(date_value),
+        action,
+        counts_summary(before) if before is not None else "—",
+        counts_summary(after) if after is not None else "—",
+        float(day_total(after_counts)) if after is not None else 0.0,
+        author or "—",
+        approved_by or "—",
+    ]
+    sheet.append(row)
+    sheet.cell(row=sheet.max_row, column=6).number_format = '0.00" €"'
+
+
+def _save_day_sync(path: Path, date_value: str, counts, history: Optional[dict] = None) -> Decimal:
     _ensure_workbook(path)
     workbook, sheet, _ = _open_sheet(path)
     values = normalize_counts(counts)
     total = day_total(values)
+
+    before = None
+    for row_date, row_counts, _row_total in _rows_from_sheet(sheet):
+        if row_date == date_value:
+            before = row_counts
+            break
 
     updated = False
     for row_idx in range(2, sheet.max_row + 1):
@@ -536,6 +606,14 @@ def _save_day_sync(path: Path, date_value: str, counts) -> Decimal:
     if not updated:
         sheet.append([date_value, *(int(count) for count in values), float(total)])
 
+    if history is not None:
+        _append_history(
+            workbook, date_value,
+            history.get("action") or ("Змінено" if before is not None else "Новий запис"),
+            before, values,
+            history.get("author", ""), history.get("approved_by", ""),
+        )
+
     _save_workbook(workbook, path)
 
     # Новий стан місяця вже є в пам\'яті (та сама книга, яку щойно записали) —
@@ -545,7 +623,7 @@ def _save_day_sync(path: Path, date_value: str, counts) -> Decimal:
     return total
 
 
-def _delete_day_sync(path: Path, date_value: str) -> tuple[bool, int]:
+def _delete_day_sync(path: Path, date_value: str, history: Optional[dict] = None) -> tuple[bool, int]:
     """Видаляє запис за дату. Повертає (чи видалено, скільки днів лишилось).
 
     Якщо після видалення в місяці не лишається жодного дня — файл видаляється,
@@ -567,11 +645,26 @@ def _delete_day_sync(path: Path, date_value: str) -> tuple[bool, int]:
             _save_workbook(workbook, path)
         return False, len(kept)
 
+    removed_counts = None
+    for row_date, row_counts, _row_total in _rows_from_sheet(sheet):
+        if row_date == date_value:
+            removed_counts = row_counts
+            break
+
     if not kept:
-        workbook.close()
-        path.unlink()
-        _invalidate_month_cache(path)
-        logger.info("Прибрано порожній файл місяця: %s", path.name)
+        # Останній день місяця: файл видаляти не можна — разом з ним зникла б
+        # історія. Лишаємо порожню таблицю з аркушем «Історія».
+        workbook.remove(sheet)
+        new_sheet = workbook.create_sheet(SHEET_NAME, 0)
+        new_sheet.append(COLUMNS)
+        if history is not None:
+            _append_history(
+                workbook, date_value, history.get("action") or "Видалено", removed_counts, None,
+                history.get("author", ""), history.get("approved_by", ""),
+            )
+        _save_workbook(workbook, path)
+        _cache_rows_after_write(path, [])
+        logger.info("Місяць %s лишився без записів (історія збережена)", path.name)
         return True, 0
 
     workbook.remove(sheet)
@@ -579,6 +672,11 @@ def _delete_day_sync(path: Path, date_value: str) -> tuple[bool, int]:
     new_sheet.append(COLUMNS)
     for row in kept:
         new_sheet.append(row)
+    if history is not None:
+        _append_history(
+            workbook, date_value, history.get("action") or "Видалено", removed_counts, None,
+            history.get("author", ""), history.get("approved_by", ""),
+        )
     _save_workbook(workbook, path)
     _cache_rows_after_write(path, _rows_from_sheet(new_sheet))
     return True, len(kept)
@@ -712,6 +810,12 @@ def cleanup_empty_files() -> int:
         if not USER_FILE_PATTERN.match(path.name):
             continue
         if _month_stats_sync(path)[0] > 0:
+            continue
+        try:
+            if HISTORY_SHEET in load_workbook(path, read_only=True).sheetnames:
+                continue  # днів немає, але історія змін має лишитись
+        except Exception as error:  # noqa: BLE001
+            logger.warning("Не вдалося перевірити %s: %s", path.name, error)
             continue
         try:
             path.unlink()
@@ -955,6 +1059,38 @@ _REPORT_THIN = Side(style="thin", color="FFBFBFBF")
 _REPORT_BORDER = Border(left=_REPORT_THIN, right=_REPORT_THIN, top=_REPORT_THIN, bottom=_REPORT_THIN)
 
 
+def _copy_history_sheet(source: Path, workbook) -> None:
+    """Переносить аркуш «Історія» з робочого файлу у звіт — щоб людина бачила,
+    хто і коли міняв її дні, а не тільки підсумок."""
+    try:
+        book = load_workbook(source, read_only=True, data_only=True)
+    except Exception as error:  # noqa: BLE001 — без історії звіт усе одно валідний
+        logger.warning("Не вдалося прочитати історію з %s: %s", source.name, error)
+        return
+    try:
+        if HISTORY_SHEET not in book.sheetnames:
+            return
+        rows = list(book[HISTORY_SHEET].iter_rows(values_only=True))
+    finally:
+        book.close()
+
+    if len(rows) < 2:
+        return
+
+    sheet = workbook.create_sheet(HISTORY_SHEET)
+    for row in rows:
+        sheet.append(list(row))
+    for cell in sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFFFF")
+        cell.fill = _REPORT_HEADER_FILL
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for index, width in enumerate([17, 12, 22, 34, 34, 15, 22, 22], start=1):
+        sheet.column_dimensions[get_column_letter(index)].width = width
+    for row_idx in range(2, sheet.max_row + 1):
+        sheet.cell(row=row_idx, column=6).number_format = REPORT_MONEY_FORMAT
+    sheet.freeze_panes = "A2"
+
+
 def _build_user_report_sync(path: Path, month: str, display_name: str = "") -> Optional[Path]:
     """Оформлений місячний звіт. Показуються лише ті категорії, які людина
     цього місяця реально робила — інакше половина таблиці була б нулями.
@@ -1087,6 +1223,8 @@ def _build_user_report_sync(path: Path, month: str, display_name: str = "") -> O
     sheet.page_setup.orientation = "landscape"
     sheet.print_title_rows = f"{header_row}:{header_row}"
 
+    _copy_history_sheet(path, workbook)
+
     report_path = DATA_DIR / f"report_{path.stem}.xlsx"
     _save_workbook(workbook, report_path)
     return report_path
@@ -1172,6 +1310,7 @@ def _set_access_sync(user_id: int, approved: Optional[bool], requested_at: Optio
         entry["requested_at"] = requested_at
     mapping[str(user_id)] = entry
     _save_user_map_sync(mapping)
+    _refresh_pending_access_count()
 
 
 def _is_approved_sync(user_id: int) -> bool:
@@ -1179,6 +1318,18 @@ def _is_approved_sync(user_id: int) -> bool:
         return True
     entry = _load_user_map_sync().get(str(user_id))
     return bool(isinstance(entry, dict) and entry.get("approved") is True)
+
+
+# Скільки заявок на доступ чекає. Меню малюється в event loop, тож читати
+# заради лічильника users.json з диска не можна — тримаємо число в пам'яті й
+# оновлюємо там, де воно змінюється (старт, нова заявка, рішення адміна).
+_pending_access_count = 0
+
+
+def _refresh_pending_access_count() -> int:
+    global _pending_access_count
+    _pending_access_count = len(_pending_access_sync())
+    return _pending_access_count
 
 
 def _pending_access_sync() -> list[tuple[int, str]]:
@@ -1227,12 +1378,12 @@ def _filter_log_sync(marker: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
-async def save_day(user_id: int, month: str, day: int, counts) -> Decimal:
+async def save_day(user_id: int, month: str, day: int, counts, history: Optional[dict] = None) -> Decimal:
     path = user_file(user_id, month)
     date_value = f"{month}-{day:02d}"
     values = normalize_counts(counts)
-    async with _lock_for(path.name):
-        total = await asyncio.to_thread(_save_day_sync, path, date_value, values)
+    async with file_lock(path.name):
+        total = await asyncio.to_thread(_save_day_sync, path, date_value, values, history)
     logger.info(
         "%s — зберіг день %s: %s = %s €",
         user_tag(user_id), _human_date(date_value), counts_summary(values), format_money(total),
@@ -1240,11 +1391,11 @@ async def save_day(user_id: int, month: str, day: int, counts) -> Decimal:
     return total
 
 
-async def delete_day(user_id: int, month: str, day: int) -> tuple[bool, int]:
+async def delete_day(user_id: int, month: str, day: int, history: Optional[dict] = None) -> tuple[bool, int]:
     path = user_file(user_id, month)
     date_value = f"{month}-{day:02d}"
-    async with _lock_for(path.name):
-        removed, remaining = await asyncio.to_thread(_delete_day_sync, path, date_value)
+    async with file_lock(path.name):
+        removed, remaining = await asyncio.to_thread(_delete_day_sync, path, date_value, history)
     if removed:
         logger.info(
             "%s — видалив день %s (днів у місяці лишилось: %s)",
@@ -1257,7 +1408,7 @@ async def delete_day(user_id: int, month: str, day: int) -> tuple[bool, int]:
 
 async def read_day(user_id: int, month: str, day: int) -> Optional[tuple[int, ...]]:
     path = user_file(user_id, month)
-    async with _lock_for(path.name):
+    async with file_lock(path.name):
         return await asyncio.to_thread(_read_day_sync, path, f"{month}-{day:02d}")
 
 
@@ -1268,15 +1419,21 @@ async def month_has_data(path: Path) -> bool:
     return await asyncio.to_thread(_month_has_data_sync, path)
 
 
+async def person_label(user_id: int) -> str:
+    """«Іван Петренко (ID 7)» — так підписуються рядки історії змін."""
+    name = await get_registered_name(user_id)
+    return f"{name} (ID {user_id})" if name else f"ID {user_id}"
+
+
 async def month_statistics(user_id: int, month: str) -> dict:
     path = user_file(user_id, month)
-    async with _lock_for(path.name):
+    async with file_lock(path.name):
         return await asyncio.to_thread(_month_statistics_sync, path)
 
 
 async def read_month_total(user_id: int, month: str) -> Decimal:
     path = user_file(user_id, month)
-    async with _lock_for(path.name):
+    async with file_lock(path.name):
         return await asyncio.to_thread(_read_total_sync, path)
 
 
@@ -1290,7 +1447,7 @@ async def build_monthly_summary(month: str) -> Optional[Path]:
 
 async def build_user_report(user_id: int, month: str, display_name: str = "") -> Optional[Path]:
     path = user_file(user_id, month)
-    async with _lock_for(path.name):
+    async with file_lock(path.name):
         return await asyncio.to_thread(_build_user_report_sync, path, month, display_name)
 
 
@@ -1320,7 +1477,7 @@ async def register_user(user) -> None:
     display_name = getattr(user, "username", None) or getattr(user, "full_name", "") or ""
     if _registered_users.get(user.id) == display_name:
         return
-    async with _lock_for(USERS_FILE.name):
+    async with file_lock(USERS_FILE.name):
         await asyncio.to_thread(_register_user_sync, user.id, display_name)
     _registered_users[user.id] = display_name
 
@@ -1348,7 +1505,7 @@ async def known_users() -> dict[int, tuple[str, bool]]:
 
 
 async def save_registered_name(user_id: int, full_name: str) -> None:
-    async with _lock_for(USERS_FILE.name):
+    async with file_lock(USERS_FILE.name):
         await asyncio.to_thread(_save_registered_name_sync, user_id, full_name)
 
 
@@ -1388,7 +1545,7 @@ async def user_allowed(user_id: int) -> bool:
 
 
 async def set_access(user_id: int, approved: Optional[bool], requested_at: Optional[float] = None) -> None:
-    async with _lock_for(USERS_FILE.name):
+    async with file_lock(USERS_FILE.name):
         await asyncio.to_thread(_set_access_sync, user_id, approved, requested_at)
 
 
@@ -1446,7 +1603,7 @@ def build_main_menu(user_id: Optional[int] = None, month: Optional[str] = None) 
         [InlineKeyboardButton("📝 Редагувати дані", callback_data="edit_day_menu")],
     ]
     if is_admin(user_id):
-        waiting_access = len(_pending_access_sync())
+        waiting_access = _pending_access_count
         if waiting_access:
             buttons.append(
                 [InlineKeyboardButton(f"🔐 Заявки на доступ ({waiting_access})", callback_data="access_requests")]
@@ -1691,8 +1848,11 @@ def _load_pending_reviews_sync() -> int:
         if not review.get("id") or not review.get("user_id"):
             continue
         previous = review.get("previous")
-        if isinstance(previous, list) and len(previous) == 2:
-            review["previous"] = (int(previous[0]), int(previous[1]))
+        if isinstance(previous, list):
+            # JSON не знає кортежів: після рестарту previous приходить списком.
+            # Приводимо до кортежу лічильників — рівно як у read_day, щоб
+            # порівняння «змінилось / не змінилось» працювало однаково.
+            review["previous"] = normalize_counts(previous)
         _pending_reviews[review["id"]] = review
         restored += 1
     return restored
@@ -2163,15 +2323,32 @@ async def on_category_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     data = query.data
     user_id = query.from_user.id
 
+    # Кнопки в старому повідомленні після перезапуску бота: контекст порожній,
+    # тож не тиснемо галочки в нікуди, а чемно повертаємо до вибору дати.
+    if context.user_data.get("flow") != "review" and not context.user_data.get("month"):
+        await ack(query, "Сеанс перервано — обери день заново")
+        context.user_data.clear()
+        context.user_data["awaiting_date"] = True
+        await safe_edit(
+            query, f"За який день? {DATE_HINT}", reply_markup=build_date_keyboard(user_id=user_id)
+        )
+        return WAIT_DATE
+
     if data == "cat_next":
         selected = _selected_keys(context)
         if not selected:
             await ack(query, "Познач хоча б одну категорію")
             return WAIT_CATEGORIES
         await ack(query)
-        context.user_data["queue"] = [
-            key for key in selected if not context.user_data.get("counts", {}).get(key)
-        ] or []
+        # У правці чужого запиту адмін прийшов саме по цифри, тому питаємо їх
+        # заново по кожній відзначеній категорії (з підказкою поточного
+        # значення). У своєму записі питаємо лише те, чого ще немає.
+        if context.user_data.get("flow") == "review":
+            context.user_data["queue"] = list(selected)
+        else:
+            context.user_data["queue"] = [
+                key for key in selected if not context.user_data.get("counts", {}).get(key)
+            ]
         if not context.user_data["queue"]:
             return await show_confirmation(query, context, edit=True)
         return await ask_next_count(query, context, edit=True)
@@ -2402,7 +2579,10 @@ async def confirm_and_store(query: CallbackQuery, context: ContextTypes.DEFAULT_
 
     if is_admin(user_id):
         if action == "delete":
-            removed, remaining = await delete_day(user_id, month, day)
+            removed, remaining = await delete_day(
+                user_id, month, day,
+                history={"action": "Видалено (адмін)", "author": await person_label(user_id)},
+            )
             context.user_data.clear()
             if not removed:
                 text = f"Запис за {date_text} не знайдено — нічого не змінено."
@@ -2421,7 +2601,13 @@ async def confirm_and_store(query: CallbackQuery, context: ContextTypes.DEFAULT_
             await safe_edit(query, text, reply_markup=build_main_menu(user_id=user_id, month=month))
             return WAIT_NEXT_ACTION
 
-        total = await save_day(user_id, month, day, counts)
+        total = await save_day(
+            user_id, month, day, counts,
+            history={
+                "action": "Новий запис (адмін)" if action == "add" else "Змінено (адмін)",
+                "author": await person_label(user_id),
+            },
+        )
         monthly_total = await read_month_total(user_id, month)
         context.user_data.clear()
         lines = ["✅ Збережено" if action == "add" else "✏️ Оновлено", date_text]
@@ -2625,10 +2811,12 @@ async def _dispatch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not months:
             await ack(query, "Даних ще немає — спочатку додай день ➕")
             return WAIT_NEXT_ACTION
+        title = "Вибери місяць:"
+        if admin and target is not None and target != user_id:
+            name = await get_registered_name(target) or str(target)
+            title = f"Місяці — {name}:"
         await safe_edit(
-            query,
-            "Вибери місяць:",
-            reply_markup=build_month_selection_keyboard(months, back_callback="show_stats"),
+            query, title, reply_markup=build_month_selection_keyboard(months, back_callback="show_stats")
         )
         return WAIT_MONTH_INPUT
 
@@ -2693,6 +2881,7 @@ async def _dispatch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return await send_monthly_summary(query, match.group(1))
 
     if data in ("admin_users", "admin_log_by_user"):
+        context.user_data.pop("admin_view_user", None)  # більше нікого не «тримаємо»
         users = await known_users()
         if not users:
             await ack(query, "Користувачів ще немає")
@@ -2715,18 +2904,10 @@ async def _dispatch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     match = RE_ADMIN_USER.match(data)
     if match:
-        selected = int(match.group(1))
-        context.user_data["admin_view_user"] = selected
-        months = await list_months(selected)
-        if not months:
-            await ack(query, "У цього користувача немає даних")
-            return WAIT_NEXT_ACTION
-        await safe_edit(
-            query,
-            f"Оберіть місяць для користувача {selected}:",
-            reply_markup=build_month_selection_keyboard(months, back_callback="admin_users"),
-        )
-        return WAIT_MONTH_INPUT
+        # Обрав людину — одразу її статистика за поточний місяць, а вже звідти
+        # минулі місяці та звіт. Раніше тут був зайвий крок з вибором місяця.
+        context.user_data["admin_view_user"] = int(match.group(1))
+        return await show_statistics(query, context)
 
     if data == "admin_logs":
         keyboard = InlineKeyboardMarkup(
@@ -2800,7 +2981,7 @@ async def handle_review_approve(query: CallbackQuery, context: ContextTypes.DEFA
         await ack(query, "Доступ заборонено", alert=True)
         return WAIT_NEXT_ACTION
 
-    async with _lock_for(f"review:{review_id}"):
+    async with file_lock(f"review:{review_id}"):
         review = _pending_reviews.get(review_id)
         if review is None or review["status"] != "pending":
             await ack(query, "Цей запит вже оброблено або застарів.", alert=True)
@@ -2808,13 +2989,19 @@ async def handle_review_approve(query: CallbackQuery, context: ContextTypes.DEFA
         review["status"] = "approved"
         review["resolved_by"] = admin_id
         del _pending_reviews[review_id]  # оброблений запит більше не тримаємо в пам'яті
-    _locks.pop(f"review:{review_id}", None)
     await persist_pending_reviews()
 
+    history = {
+        "action": "Видалено (підтверджено)" if review["action"] == "delete" else "Підтверджено",
+        "author": review["user_label"],
+        "approved_by": await person_label(admin_id),
+    }
     if review["action"] == "delete":
-        await delete_day(review["user_id"], review["month"], review["day"])
+        await delete_day(review["user_id"], review["month"], review["day"], history=history)
     else:
-        await save_day(review["user_id"], review["month"], review["day"], review_counts(review))
+        await save_day(
+            review["user_id"], review["month"], review["day"], review_counts(review), history=history
+        )
 
     _reset_admin_notifications_if_empty()
     await _refresh_after_action(query, admin_id, review)
@@ -2833,7 +3020,7 @@ async def handle_review_reject(query: CallbackQuery, context: ContextTypes.DEFAU
         await ack(query, "Доступ заборонено", alert=True)
         return WAIT_NEXT_ACTION
 
-    async with _lock_for(f"review:{review_id}"):
+    async with file_lock(f"review:{review_id}"):
         review = _pending_reviews.get(review_id)
         if review is None or review["status"] != "pending":
             await ack(query, "Цей запит вже оброблено або застарів.", alert=True)
@@ -2841,7 +3028,6 @@ async def handle_review_reject(query: CallbackQuery, context: ContextTypes.DEFAU
         review["status"] = "rejected"
         review["resolved_by"] = admin_id
         del _pending_reviews[review_id]
-    _locks.pop(f"review:{review_id}", None)
     await persist_pending_reviews()
 
     _reset_admin_notifications_if_empty()
@@ -2892,7 +3078,7 @@ async def finish_review_edit(query: CallbackQuery, context: ContextTypes.DEFAULT
 
     values = normalize_counts(counts)
 
-    async with _lock_for(f"review:{review_id}"):
+    async with file_lock(f"review:{review_id}"):
         review = _pending_reviews.get(review_id)
         if review is None or review["status"] != "pending":
             await safe_edit(query, "Цей запит вже оброблено іншим адміном.")
@@ -2906,13 +3092,20 @@ async def finish_review_edit(query: CallbackQuery, context: ContextTypes.DEFAULT
             review.pop("small", None)
             review["action"] = "delete" if not has_any_count(values) else "edit"
         del _pending_reviews[review_id]
-    _locks.pop(f"review:{review_id}", None)
     await persist_pending_reviews()
 
+    history = {
+        "action": "Підтверджено" if unchanged else "Змінено адміном",
+        "author": review["user_label"],
+        "approved_by": await person_label(admin_id),
+    }
     if review["action"] == "delete":
-        await delete_day(review["user_id"], review["month"], review["day"])
+        history["action"] = "Видалено (адмін)"
+        await delete_day(review["user_id"], review["month"], review["day"], history=history)
     else:
-        await save_day(review["user_id"], review["month"], review["day"], review_counts(review))
+        await save_day(
+            review["user_id"], review["month"], review["day"], review_counts(review), history=history
+        )
 
     _reset_admin_notifications_if_empty()
     if origin_chat_id is not None and origin_message_id is not None:
@@ -2982,7 +3175,9 @@ async def build_statistics_text(user_id: int, month: str, owner_label: Optional[
 async def show_statistics(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, month: Optional[str] = None) -> int:
     """Екран «Статистика»: поточний місяць підтягується сам, без вибору зі списку."""
     user_id = query.from_user.id
-    admin_target = context.user_data.pop("admin_view_user", None) if is_admin(user_id) else None
+    # admin_view_user не знімаємо: адмін гортає місяці й звіти цієї людини,
+    # доки не вийде в меню чи не обере іншу (там user_data очищається).
+    admin_target = context.user_data.get("admin_view_user") if is_admin(user_id) else None
     target_id = admin_target if admin_target is not None else user_id
     month = month or current_month()
 
@@ -2995,15 +3190,22 @@ async def show_statistics(query: CallbackQuery, context: ContextTypes.DEFAULT_TY
     text = await build_statistics_text(target_id, month, owner_label)
     context.user_data["download_user"] = target_id
 
+    back = "admin_users" if admin_target is not None else None
     if await month_has_data(user_file(target_id, month)):
-        keyboard = build_month_result_keyboard(month)
+        keyboard = build_month_result_keyboard(month, back_callback=back)
     else:
-        # Поточний місяць порожній: пропонуємо або внести день, або глянути
-        # інший місяць — але тільки якщо ті інші місяці взагалі є.
-        rows = [[InlineKeyboardButton("➕ Внести дані", callback_data="add_more")]]
+        # Порожній місяць: своєму користувачу пропонуємо внести день, адміну —
+        # тільки перехід до інших місяців (за чужого нічого вносити не треба).
+        rows = []
+        if admin_target is None:
+            rows.append([InlineKeyboardButton("➕ Внести дані", callback_data="add_more")])
         if await list_months(target_id):
             rows.append([InlineKeyboardButton("🗓 Інший місяць", callback_data="show_month_total")])
-        rows.append([InlineKeyboardButton("🏠 Меню", callback_data="close_entry")])
+        last_row = []
+        if back:
+            last_row.append(InlineKeyboardButton("⬅️ Назад", callback_data=back))
+        last_row.append(InlineKeyboardButton("🏠 Меню", callback_data="close_entry"))
+        rows.append(last_row)
         keyboard = InlineKeyboardMarkup(rows)
 
     await safe_edit(query, text, reply_markup=keyboard)
@@ -3012,7 +3214,7 @@ async def show_statistics(query: CallbackQuery, context: ContextTypes.DEFAULT_TY
 
 async def show_month_total(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, month: str) -> int:
     user_id = query.from_user.id
-    admin_target = context.user_data.pop("admin_view_user", None) if is_admin(user_id) else None
+    admin_target = context.user_data.get("admin_view_user") if is_admin(user_id) else None
     target_id = admin_target if admin_target is not None else user_id
 
     path = user_file(target_id, month)
@@ -3106,7 +3308,7 @@ async def process_month_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         return WAIT_MONTH_INPUT
 
     user_id = update.message.from_user.id
-    admin_target = context.user_data.pop("admin_view_user", None) if is_admin(user_id) else None
+    admin_target = context.user_data.get("admin_view_user") if is_admin(user_id) else None
 
     if is_admin(user_id) and admin_target is None:
         total, names = await read_all_totals(month)
@@ -3333,6 +3535,13 @@ def main() -> None:
             "BOT_TOKEN не задано. Вкажи його в config.py або в змінній оточення BOT_TOKEN."
         )
 
+    if not ADMIN_IDS:
+        raise RuntimeError(
+            "ADMIN_IDS не задано. Додай у config.py рядок ADMIN_IDS = \"442336138\" "
+            "(через кому, якщо адмінів кілька) або задай змінну оточення ADMIN_IDS. "
+            "Без адміна нікому підтверджувати записи й видавати доступ."
+        )
+
     # Починаючи з Python 3.12 asyncio.get_event_loop() не створює цикл сам,
     # а в 3.14 кидає RuntimeError. PTB викликає його всередині run_polling(),
     # тому створюємо цикл явно.
@@ -3353,7 +3562,18 @@ def main() -> None:
     callback_handler = CallbackQueryHandler(on_callback, pattern=CALLBACK_PATTERN)
 
     conversation = ConversationHandler(
-        entry_points=[CommandHandler("start", start), CommandHandler("menu", start)],
+        # Кнопки — теж вхідні точки. Стан діалогу PTB тримає в пам'яті, тож
+        # після перезапуску бота (оновлення, ребут) кнопки в уже надісланих
+        # повідомленнях інакше «не працювали б»: натискання не потрапляло б у
+        # жоден стан і бот мовчав. Тепер натискання само починає діалог з
+        # потрібного кроку — черга запитів для цього піднімається з диска.
+        entry_points=[
+            CommandHandler("start", start),
+            CommandHandler("menu", start),
+            callback_handler,
+            CallbackQueryHandler(on_category_button, pattern=r"^cat_"),
+            CallbackQueryHandler(confirm_entry, pattern=r"^(save_entry|edit_entry)$"),
+        ],
         states={
             WAIT_DATE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, process_date),
@@ -3399,6 +3619,10 @@ def main() -> None:
     if removed:
         logger.info("Старт: прибрано порожніх файлів місяця — %d", removed)
 
+    waiting_access = _refresh_pending_access_count()
+    if waiting_access:
+        logger.info("Старт: заявок на доступ у черзі — %d", waiting_access)
+
     restored = _load_pending_reviews_sync()
     if restored:
         logger.info("Старт: відновлено запитів у черзі — %d", restored)
@@ -3413,5 +3637,337 @@ def main() -> None:
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
+# --------------------------------------------------------------------------- #
+# Тести
+#
+# Живуть у цьому ж файлі, щоб деплой лишався одним файлом: скопіював на сервер —
+# і одразу можеш перевірити, що нічого не поламалось.
+#
+#     python3 salary_bot.py --test          усі тести
+#     python3 salary_bot.py --test -v       з переліком
+#
+# Покривають три ділянки, де регресію найлегше не помітити: грошові розрахунки,
+# читання старих форматів файлів і чергу підтверджень. Telegram API не
+# зачіпається — тільки чисті функції та робота з файлами.
+# --------------------------------------------------------------------------- #
+
+import unittest  # noqa: E402 — потрібен лише для тестів, тримаємо поруч з ними
+
+sb = sys.modules[__name__]  # тести звертаються до модуля через sb, як у окремому файлі
+
+
+def _tmp_path(name: str):
+    """Тимчасовий файл у DATA_DIR — саме там, де бот працює насправді."""
+    path = sb.DATA_DIR / name
+    if path.exists():
+        path.unlink()
+    return path
+
+
+class MoneyTests(unittest.TestCase):
+    """Розрахунки. Числа взяті з домовлених ставок, а не з коду."""
+
+    def test_rate_per_category(self):
+        expected = {
+            "box_177": "45.00",    # 100 × 0.90 / 2 (удвох)
+            "box_161": "35.00",    # 100 × 0.70 / 2
+            "winkel_177": "17.50",  # 100 × 0.35 / 2
+            "winkel_161": "17.50",
+            "dekel_177": "30.00",  # 100 × 0.30, працює сам
+            "dekel_161": "20.00",  # 100 × 0.20
+        }
+        for key, value in expected.items():
+            with self.subTest(key=key):
+                self.assertEqual(sb.format_money(sb.category_money(key, 100)), value)
+
+    def test_dekel_is_not_split(self):
+        self.assertEqual(sb.CATEGORY_WORKERS["dekel_177"], 1)
+        self.assertEqual(sb.CATEGORY_WORKERS["box_177"], 2)
+        self.assertNotIn("/", sb.rate_formula("dekel_177", 100))
+        self.assertIn("/ 2", sb.rate_formula("box_177", 100))
+
+    def test_mixed_day(self):
+        counts = {"box_177": 50, "winkel_161": 200, "dekel_177": 100, "dekel_161": 50}
+        expected = Decimal("22.50") + Decimal("35.00") + Decimal("30.00") + Decimal("10.00")
+        self.assertEqual(sb.day_total(counts), expected)
+
+    def test_rounding_is_half_up(self):
+        # 1 × 0.35 / 2 = 0.175 -> 0.18, а не 0.17
+        self.assertEqual(sb.format_money(sb.category_money("winkel_177", 1)), "0.18")
+        self.assertEqual(sb.money("2.345"), Decimal("2.35"))
+
+    def test_no_float_drift_over_month(self):
+        """22 дні по 0.175 € мають дати рівно суму округлених днів."""
+        day = sb.day_total({"winkel_177": 1})
+        self.assertEqual(sb.money(day * 22), Decimal("3.96"))
+
+    def test_normalize_counts(self):
+        self.assertEqual(sb.normalize_counts({"box_177": 5}), (5, 0, 0, 0, 0, 0))
+        self.assertEqual(sb.normalize_counts([1, 2]), (1, 2, 0, 0, 0, 0))
+        self.assertEqual(sb.normalize_counts({"box_177": -7}), (0, 0, 0, 0, 0, 0))
+        self.assertEqual(sb.normalize_counts(None), sb.EMPTY_COUNTS)
+
+    def test_counts_summary_skips_zeros(self):
+        text = sb.counts_summary({"box_177": 10, "dekel_161": 3})
+        self.assertEqual(text, "Коробки 177: 10, Dekel 161: 3")
+        self.assertEqual(sb.counts_summary({}), "—")
+
+
+class DateTests(unittest.TestCase):
+    def test_accepted_formats(self):
+        for raw in ("15-08-2026", "15.08.2026", "15,08,2026"):
+            with self.subTest(raw=raw):
+                self.assertIsNotNone(sb.parse_date_input(raw))
+
+    def test_impossible_date(self):
+        self.assertIsNone(sb.parse_date_input("31-02-2026"))
+
+    def test_human_date(self):
+        self.assertEqual(sb._human_date("2026-08-15"), "15.08.2026")
+
+
+class LegacyFileTests(unittest.TestCase):
+    """Файли, створені до появи winkel/dekel, мають читатись без міграції вручну."""
+
+    def tearDown(self):
+        for path in sb.DATA_DIR.glob("999*_*.xlsx"):
+            path.unlink()
+        sb._rows_cache.clear()
+
+    def _write(self, name: str, header: list, rows: list):
+        path = _tmp_path(name)
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = sb.SHEET_NAME
+        sheet.append(header)
+        for row in rows:
+            sheet.append(row)
+        workbook.save(path)
+        return path
+
+    def test_boxes_only_file(self):
+        path = self._write(
+            "9991_2026-07.xlsx",
+            ["Дата", "Коробки 177", "Коробки 161", "Загальна сума за день"],
+            [["2026-07-01", 100, 50, 62.50]],
+        )
+        self.assertEqual(sb._read_day_sync(path, "2026-07-01"), (100, 50, 0, 0, 0, 0))
+        self.assertEqual(sb._read_total_sync(path), Decimal("62.50"))
+
+    def test_ancient_six_column_file(self):
+        path = self._write(
+            "9992_2026-06.xlsx",
+            ["Дата", "Великі коробки", "x", "Малі коробки", "y", "Сума"],
+            [["2026-06-01", 100, None, 50, None, 62.5]],
+        )
+        self.assertEqual(sb._read_day_sync(path, "2026-06-01"), (100, 50, 0, 0, 0, 0))
+
+    def test_write_migrates_layout_and_keeps_old_days(self):
+        path = self._write(
+            "9993_2026-07.xlsx",
+            ["Дата", "Коробки 177", "Коробки 161", "Загальна сума за день"],
+            [["2026-07-01", 100, 50, 62.50]],
+        )
+        sb._save_day_sync(path, "2026-07-02", {"winkel_177": 10, "dekel_161": 20})
+
+        header = list(next(load_workbook(path)[sb.SHEET_NAME].iter_rows(max_row=1, values_only=True)))
+        self.assertEqual(header, sb.COLUMNS)
+        self.assertEqual(sb._read_day_sync(path, "2026-07-01"), (100, 50, 0, 0, 0, 0))
+        self.assertEqual(sb._read_day_sync(path, "2026-07-02"), (0, 0, 10, 0, 0, 20))
+
+    def test_duplicate_dates_keep_last(self):
+        path = self._write(
+            "9994_2026-05.xlsx",
+            sb.COLUMNS,
+            [["2026-05-01", 10, 0, 0, 0, 0, 0, 4.5], ["2026-05-01", 20, 0, 0, 0, 0, 0, 9.0]],
+        )
+        self.assertEqual(sb._read_day_sync(path, "2026-05-01")[0], 20)
+
+    def test_garbage_rows_are_skipped(self):
+        path = self._write(
+            "9995_2026-05.xlsx",
+            sb.COLUMNS,
+            [["сміття", 1, 2, 3, 4, 5, 6, 7], ["2026-05-02", 10, 0, 0, 0, 0, 0, 4.5]],
+        )
+        self.assertEqual(len(sb._month_rows_sync(path)), 1)
+
+
+class StorageTests(unittest.TestCase):
+    """Запис, правка, видалення дня та історія змін."""
+
+    def setUp(self):
+        self.path = _tmp_path("9990_2026-08.xlsx")
+        sb._rows_cache.clear()
+
+    def tearDown(self):
+        if self.path.exists():
+            self.path.unlink()
+        sb._rows_cache.clear()
+
+    def test_save_then_update_day(self):
+        sb._save_day_sync(self.path, "2026-08-01", {"box_177": 100})
+        self.assertEqual(sb._read_total_sync(self.path), Decimal("45.00"))
+        sb._save_day_sync(self.path, "2026-08-01", {"box_177": 200})
+        self.assertEqual(sb._read_total_sync(self.path), Decimal("90.00"))
+        self.assertEqual(len(sb._month_rows_sync(self.path)), 1)
+
+    def test_cache_follows_file_changes(self):
+        sb._save_day_sync(self.path, "2026-08-01", {"box_177": 100})
+        self.assertEqual(sb._read_day_sync(self.path, "2026-08-01")[0], 100)
+        sb._save_day_sync(self.path, "2026-08-01", {"box_177": 7})
+        self.assertEqual(sb._read_day_sync(self.path, "2026-08-01")[0], 7)
+
+    def test_delete_keeps_history_sheet(self):
+        sb._save_day_sync(self.path, "2026-08-01", {"box_177": 100},
+                          history={"action": "Новий запис", "author": "Іван"})
+        removed, remaining = sb._delete_day_sync(
+            self.path, "2026-08-01", history={"action": "Видалено", "author": "Тарас"}
+        )
+        self.assertTrue(removed)
+        self.assertEqual(remaining, 0)
+        self.assertTrue(self.path.exists(), "файл з історією видаляти не можна")
+        self.assertIn(sb.HISTORY_SHEET, load_workbook(self.path).sheetnames)
+        self.assertFalse(sb._month_has_data_sync(self.path))
+
+    def test_history_records_before_and_after(self):
+        sb._save_day_sync(self.path, "2026-08-01", {"box_177": 200},
+                          history={"action": "Підтверджено", "author": "Іван", "approved_by": "Тарас"})
+        sb._save_day_sync(self.path, "2026-08-01", {"box_177": 180},
+                          history={"action": "Змінено адміном", "author": "Іван", "approved_by": "Тарас"})
+        rows = list(load_workbook(self.path)[sb.HISTORY_SHEET].iter_rows(min_row=2, values_only=True))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0][3], "—")                     # було: нічого
+        self.assertEqual(rows[0][4], "Коробки 177: 200")      # стало
+        self.assertEqual(rows[1][3], "Коробки 177: 200")      # було
+        self.assertEqual(rows[1][4], "Коробки 177: 180")      # стало
+        self.assertEqual(rows[1][7], "Тарас")                 # хто підтвердив
+
+    def test_month_statistics(self):
+        sb._save_day_sync(self.path, "2026-08-01", {"box_177": 100})   # 45.00
+        sb._save_day_sync(self.path, "2026-08-02", {"dekel_177": 100})  # 30.00
+        sb._save_day_sync(self.path, "2026-08-03", {})                  # порожній день
+        stats = sb._month_statistics_sync(self.path)
+        self.assertEqual(stats["total"], Decimal("75.00"))
+        self.assertEqual(stats["days"], 2, "порожній день не рахується робочим")
+        self.assertEqual(stats["average"], Decimal("37.50"))
+        self.assertEqual(stats["best_day"], "2026-08-01")
+
+
+class ReviewQueueTests(unittest.TestCase):
+    """Черга підтверджень: сумісність зі старим форматом і переживання рестарту."""
+
+    def setUp(self):
+        sb._pending_reviews.clear()
+
+    def tearDown(self):
+        sb._pending_reviews.clear()
+        if sb.PENDING_FILE.exists():
+            sb.PENDING_FILE.unlink()
+
+    def _review(self, **extra):
+        review = {
+            "id": "abcd1234",
+            "user_id": 7,
+            "user_label": "Іван Петренко",
+            "month": "2026-08",
+            "day": 1,
+            "date_text": "01-08-2026",
+            "action": "add",
+            "counts": [50, 0, 0, 0, 0, 0],
+            "previous": None,
+            "status": "pending",
+            "created_at": 1.0,
+        }
+        review.update(extra)
+        return review
+
+    def test_counts_from_new_format(self):
+        self.assertEqual(sb.review_counts(self._review()), (50, 0, 0, 0, 0, 0))
+
+    def test_counts_from_legacy_big_small(self):
+        """Запити, збережені ще до появи winkel/dekel."""
+        legacy = {"big": 40, "small": 25}
+        self.assertEqual(sb.review_counts(legacy), (40, 25, 0, 0, 0, 0))
+
+    def test_survives_restart(self):
+        sb._pending_reviews["abcd1234"] = self._review(previous=(10, 0, 0, 0, 0, 0))
+        sb._save_pending_reviews_sync()
+        sb._pending_reviews.clear()
+
+        self.assertEqual(sb._load_pending_reviews_sync(), 1)
+        restored = sb._pending_reviews["abcd1234"]
+        self.assertEqual(sb.review_counts(restored), (50, 0, 0, 0, 0, 0))
+        self.assertEqual(restored["previous"], (10, 0, 0, 0, 0, 0), "previous має лишитись кортежем")
+
+    def test_resolved_reviews_are_not_restored(self):
+        sb._pending_reviews["abcd1234"] = self._review(status="approved")
+        sb._save_pending_reviews_sync()
+        sb._pending_reviews.clear()
+        self.assertEqual(sb._load_pending_reviews_sync(), 0)
+
+    def test_broken_file_does_not_crash(self):
+        sb.PENDING_FILE.write_text("{не json", encoding="utf-8")
+        self.assertEqual(sb._load_pending_reviews_sync(), 0)
+
+    def test_review_id_matches_callback_pattern(self):
+        review_id = sb._new_review_id()
+        self.assertIsNotNone(sb.RE_REVIEW_APPROVE.match(f"review_approve_{review_id}"))
+        self.assertIsNotNone(sb.RE_REVIEW_EDIT.match(f"review_edit_{review_id}"))
+
+
+class ConcurrencyTests(unittest.TestCase):
+    """Паралельні записи не мають губити дані, а локи — накопичуватись."""
+
+    def tearDown(self):
+        for path in sb.DATA_DIR.glob("998*_*.xlsx"):
+            path.unlink()
+        sb._rows_cache.clear()
+
+    def test_parallel_saves_keep_all_days(self):
+        async def scenario():
+            await asyncio.gather(*(sb.save_day(9981, "2026-08", day, {"box_177": 10}) for day in range(1, 11)))
+            return await sb.read_month_total(9981, "2026-08")
+
+        total = asyncio.run(scenario())
+        self.assertEqual(total, Decimal("45.00"))  # 10 днів × 10 шт × 0.90 / 2
+        self.assertEqual(len(sb._month_rows_sync(sb.user_file(9981, "2026-08"))), 10)
+
+    def test_locks_do_not_accumulate(self):
+        async def scenario():
+            for index in range(20):
+                await sb.save_day(9982, "2026-08", (index % 28) + 1, {"box_177": 1})
+
+        asyncio.run(scenario())
+        self.assertEqual(sb._locks, {}, "лок на файл має прибиратись після використання")
+        self.assertEqual(sb._lock_users, {})
+
+
+class ConfigTests(unittest.TestCase):
+    def test_admin_ids_have_no_hardcoded_default(self):
+        """Бот, розгорнутий без config.py, не має давати права чужому ID."""
+        import inspect
+        source = inspect.getsource(sb)
+        self.assertIn('_setting("ADMIN_IDS", "")', source, "дефолт ADMIN_IDS має бути порожнім")
+
+    def test_callback_pattern_covers_menu_buttons(self):
+        for data in ("add_more", "show_stats", "close_entry", "date_today", "back_to_date",
+                     "back_to_categories", "admin_users", "admin_logs", "pending_reviews"):
+            with self.subTest(data=data):
+                self.assertIsNotNone(sb.CALLBACK_PATTERN.match(data))
+
+    def test_category_keys_match_columns(self):
+        self.assertEqual(len(sb.COLUMNS), sb.CATEGORY_COUNT + 2)  # дата + категорії + сума
+        self.assertEqual(sb.TOTAL_INDEX, len(sb.COLUMNS) - 1)
+
+
+def run_tests() -> None:
+    """Запуск тестів: python3 salary_bot.py --test"""
+    argv = [sys.argv[0]] + [arg for arg in sys.argv[1:] if arg != "--test"]
+    unittest.main(module=sb, argv=argv, verbosity=2, exit=True)
+
+
 if __name__ == "__main__":
-    main()
+    if "--test" in sys.argv:
+        run_tests()
+    else:
+        main()
