@@ -41,6 +41,7 @@ import os
 import re
 import sys
 import uuid
+import zipfile
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -192,7 +193,7 @@ TELEGRAM_TEXT_LIMIT = 3500  # запас до ліміту 4096
 # іменем користувача поруч з його id (див. user_tag).
 # Позначка збірки: видно в першому рядку лога після старту. Якщо після заміни
 # файлу дата тут стара — значить, працює старий процес і бот не перезапустився.
-BOT_VERSION = "2026-08-22 · історія змін, статистика по користувачу"
+BOT_VERSION = "2026-08-22 · щоденний бекап у Telegram, історія змін"
 
 LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
 LOG_DATE_FORMAT = "%d.%m.%Y %H:%M:%S"
@@ -2131,6 +2132,142 @@ async def _stale_reviews_watcher(application: Application) -> None:
             logger.exception("Stale-review watcher iteration failed")
 
 
+# --------------------------------------------------------------------------- #
+# Щоденний бекап у Telegram
+#
+# Уся зарплата команди й історія змін живуть в одній теці на одному диску. Якщо
+# інстанс помре — відновлювати нема з чого. Раз на добу бот пакує data/ у zip і
+# надсилає адмінам: копія опиняється поза сервером, у чаті й на телефоні, без
+# жодних ключів, бакетів і сторонніх сервісів.
+#
+# Налаштування в config.py:
+#     BACKUP_ENABLED = False     вимкнути
+#     BACKUP_HOUR = 23           о котрій годині (за Берліном)
+#     BACKUP_INCLUDE_LOG = True  класти в архів ще й лог
+# --------------------------------------------------------------------------- #
+
+BACKUP_ENABLED = str(_setting("BACKUP_ENABLED", "1")).strip().lower() not in ("0", "false", "no")
+BACKUP_HOUR = int(_setting("BACKUP_HOUR", 23))
+BACKUP_INCLUDE_LOG = str(_setting("BACKUP_INCLUDE_LOG", "0")).strip().lower() not in ("0", "false", "no")
+LAST_BACKUP_FILE = DATA_DIR / ".last_backup"
+_BACKUP_CHECK_INTERVAL_SECONDS = 900  # перевіряємо кожні 15 хв, шлемо раз на добу
+
+
+def _backup_files() -> list[Path]:
+    """Що кладемо в архів: місячні файли, users.json, чергу підтверджень.
+
+    Тимчасові файли (.tmp, .export_, report_) свідомо пропускаємо — це сміття
+    поточної операції, а не дані.
+    """
+    files = []
+    for path in sorted(DATA_DIR.iterdir()):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        if path.name.startswith("report_") or path.suffix == ".tmp":
+            continue
+        if path.suffix == ".log" or ".log." in path.name:
+            if not BACKUP_INCLUDE_LOG:
+                continue
+        files.append(path)
+    return files
+
+
+def _build_backup_sync() -> Optional[tuple[Path, int, int]]:
+    """Пакує data/ у zip. Повертає (шлях, кількість файлів, розмір) або None."""
+    files = _backup_files()
+    if not files:
+        return None
+
+    stamp = datetime.now(BERLIN_TZ).strftime("%Y-%m-%d")
+    archive = DATA_DIR / f".backup_{stamp}.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+        for path in files:
+            try:
+                bundle.write(path, arcname=path.name)
+            except OSError as error:  # noqa: PERF203 — один битий файл не має валити бекап
+                logger.warning("Не вдалося покласти в бекап %s: %s", path.name, error)
+    return archive, len(files), archive.stat().st_size
+
+
+async def send_backup(bot, reason: str = "щоденний") -> bool:
+    """Збирає архів і надсилає його всім адмінам. True, якщо хоч комусь дійшло."""
+    built = await asyncio.to_thread(_build_backup_sync)
+    if built is None:
+        logger.info("Бекап пропущено: у data/ немає файлів")
+        return False
+
+    archive, count, size = built
+    months = len([f for f in _backup_files() if f.suffix == ".xlsx"])
+    caption = (
+        f"💾 Резервна копія ({reason})\n"
+        f"Дата: {datetime.now(BERLIN_TZ).strftime('%d.%m.%Y %H:%M')}\n"
+        f"Файлів: {count} (з них місячних: {months})\n"
+        f"Розмір: {size / 1024:.0f} КБ\n\n"
+        "Збережи цей файл — це повна копія даних бота."
+    )
+
+    delivered = False
+    try:
+        for admin_id in ADMIN_IDS:
+            try:
+                with open(archive, "rb") as fh:
+                    await bot.send_document(admin_id, document=fh, filename=archive.name[1:], caption=caption)
+                delivered = True
+            except Exception as error:  # noqa: BLE001 — недоступний адмін не має зривати бекап
+                logger.warning("Не вдалося надіслати бекап адміну %s: %s", admin_id, error)
+    finally:
+        try:
+            archive.unlink()
+        except OSError:
+            pass
+
+    if delivered:
+        try:
+            LAST_BACKUP_FILE.write_text(datetime.now(BERLIN_TZ).strftime("%Y-%m-%d"), encoding="utf-8")
+        except OSError as error:
+            logger.warning("Не вдалося записати дату бекапу: %s", error)
+        logger.info("Бекап надіслано (%s): %d файлів, %d КБ", reason, count, size // 1024)
+    return delivered
+
+
+def _backup_due() -> bool:
+    """Чи час робити щоденний бекап. Дата останнього лежить у файлі, тож
+    перезапуск бота не спричинить другий архів за той самий день."""
+    now = datetime.now(BERLIN_TZ)
+    if now.hour < BACKUP_HOUR:
+        return False
+    try:
+        last = LAST_BACKUP_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        last = ""
+    return last != now.strftime("%Y-%m-%d")
+
+
+async def _backup_watcher(application: Application) -> None:
+    while True:
+        try:
+            await asyncio.sleep(_BACKUP_CHECK_INTERVAL_SECONDS)
+            if BACKUP_ENABLED and _backup_due():
+                await send_backup(application.bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — цикл має пережити будь-який збій
+            logger.exception("Backup watcher iteration failed")
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/backup — зібрати й надіслати копію просто зараз (тільки адмін)."""
+    user_id = update.message.from_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступ заборонено.")
+        logger.warning("%s — спроба /backup без прав", user_tag(user_id))
+        return
+
+    await update.message.reply_text("Збираю копію…")
+    if not await send_backup(context.bot, reason=f"вручну, {await person_label(user_id)}"):
+        await update.message.reply_text("Немає що зберігати — тека data/ порожня.")
+
+
 async def _notify_user_result(context: ContextTypes.DEFAULT_TYPE, review: dict, resolution: str) -> None:
     """resolution: 'approved' | 'rejected' | 'edited'."""
     user_id = review["user_id"]
@@ -3468,7 +3605,10 @@ async def _post_init(application: Application) -> None:
     except Exception as error:  # noqa: BLE001 — відсутність меню команд не критична
         logger.warning("Could not set default command menu: %s", error)
 
-    admin_commands = default_commands + [BotCommand("logtail", "Останні рядки логів (адмін)")]
+    admin_commands = default_commands + [
+        BotCommand("logtail", "Останні рядки логів (адмін)"),
+        BotCommand("backup", "Резервна копія даних (адмін)"),
+    ]
     for admin_id in ADMIN_IDS:
         try:
             await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
@@ -3476,6 +3616,9 @@ async def _post_init(application: Application) -> None:
             logger.warning("Could not set admin command menu for %s: %s", admin_id, error)
 
     application.bot_data["stale_watcher"] = asyncio.create_task(_stale_reviews_watcher(application))
+    if BACKUP_ENABLED:
+        application.bot_data["backup_watcher"] = asyncio.create_task(_backup_watcher(application))
+        logger.info("Щоденний бекап у Telegram: о %02d:00", BACKUP_HOUR)
     logger.info(
         "Нагадування про застряглі запити: раз на %s год про ті, що старші за %s год",
         int(STALE_REMINDER_EVERY_HOURS), int(STALE_REVIEW_HOURS),
@@ -3483,9 +3626,10 @@ async def _post_init(application: Application) -> None:
 
 
 async def _post_shutdown(application: Application) -> None:
-    task = application.bot_data.get("stale_watcher")
-    if task is not None:
-        task.cancel()
+    for name in ("stale_watcher", "backup_watcher"):
+        task = application.bot_data.get(name)
+        if task is not None:
+            task.cancel()
 
 
 class PerChatUpdateProcessor(BaseUpdateProcessor):
@@ -3613,6 +3757,7 @@ def main() -> None:
     application.add_handler(conversation)
     application.add_handler(CommandHandler("total", cmd_total))
     application.add_handler(CommandHandler("logtail", cmd_logtail))
+    application.add_handler(CommandHandler("backup", cmd_backup))
     application.add_error_handler(on_error)
 
     removed = cleanup_empty_files()
@@ -3940,6 +4085,58 @@ class ConcurrencyTests(unittest.TestCase):
         asyncio.run(scenario())
         self.assertEqual(sb._locks, {}, "лок на файл має прибиратись після використання")
         self.assertEqual(sb._lock_users, {})
+
+
+class BackupTests(unittest.TestCase):
+    """Архів має містити дані й не містити сміття."""
+
+    def setUp(self):
+        self.path = sb.user_file(9970, "2026-08")
+        sb._save_day_sync(self.path, "2026-08-01", {"box_177": 10})
+        (sb.DATA_DIR / "report_9970_2026-08.xlsx").write_bytes(b"tmp")
+        (sb.DATA_DIR / "users.json.tmp").write_text("{}", encoding="utf-8")
+
+    def tearDown(self):
+        for name in ("report_9970_2026-08.xlsx", "users.json.tmp", "9970_2026-08.xlsx"):
+            target = sb.DATA_DIR / name
+            if target.exists():
+                target.unlink()
+        for leftover in sb.DATA_DIR.glob(".backup_*.zip"):
+            leftover.unlink()
+        if sb.LAST_BACKUP_FILE.exists():
+            sb.LAST_BACKUP_FILE.unlink()
+        sb._rows_cache.clear()
+
+    def test_archive_contains_month_files(self):
+        import zipfile as zf
+        built = sb._build_backup_sync()
+        self.assertIsNotNone(built)
+        archive, count, size = built
+        try:
+            names = zf.ZipFile(archive).namelist()
+        finally:
+            archive.unlink()
+        self.assertIn("9970_2026-08.xlsx", names)
+        self.assertGreater(size, 0)
+
+    def test_archive_skips_temp_files(self):
+        import zipfile as zf
+        archive, _count, _size = sb._build_backup_sync()
+        try:
+            names = zf.ZipFile(archive).namelist()
+        finally:
+            archive.unlink()
+        self.assertNotIn("report_9970_2026-08.xlsx", names, "тимчасові звіти в бекап не йдуть")
+        self.assertNotIn("users.json.tmp", names)
+
+    def test_backup_runs_once_a_day(self):
+        from datetime import datetime as dt
+        today = dt.now(sb.BERLIN_TZ).strftime("%Y-%m-%d")
+        sb.LAST_BACKUP_FILE.write_text(today, encoding="utf-8")
+        self.assertFalse(sb._backup_due(), "другий бекап за той самий день не потрібен")
+        sb.LAST_BACKUP_FILE.write_text("2000-01-01", encoding="utf-8")
+        expected = dt.now(sb.BERLIN_TZ).hour >= sb.BACKUP_HOUR
+        self.assertEqual(sb._backup_due(), expected)
 
 
 class ConfigTests(unittest.TestCase):
